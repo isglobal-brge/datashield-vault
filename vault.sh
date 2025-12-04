@@ -3,6 +3,13 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
+# Handle stop command
+if [[ "${1:-}" == "stop" ]]; then
+    echo "Stopping DataSHIELD Vault..."
+    cd app && docker compose down
+    exit 0
+fi
+
 PORT="${1:-8000}"
 
 # Check if port is in use, find next available
@@ -29,4 +36,4 @@ echo "  mkdir data/collections/my-cohort"
 echo "  cp files... data/collections/my-cohort/"
 echo "  cat data/collections/my-cohort/.vault_key"
 echo
-echo "Stop: cd app && docker compose down"
+echo "Stop: ./vault.sh stop"

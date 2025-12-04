@@ -14,7 +14,7 @@ Containerized vault for file storage and hashing for DataSHIELD.
 From the repository root:
 
 ```bash
-./run.sh
+./vault.sh
 ```
 
 This will:
@@ -48,7 +48,7 @@ cat data/collections/my-cohort/.vault_key
 
 ```
 datashield-vault/
-├── run.sh                      # Main entry point
+├── vault.sh                    # Main entry point
 ├── app/                        # Application code
 │   ├── src/vault/              # Python package
 │   ├── docker-compose.yml
@@ -99,18 +99,18 @@ curl -H "X-Collection-Key: $KEY" \
 
 Default port: 8000
 
-If the port is in use, `run.sh` will automatically find the next available port.
+If the port is in use, `vault.sh` will automatically find the next available port.
 
 Override via argument:
 
 ```bash
-./run.sh 8080    # API on port 8080
+./vault.sh 8080    # API on port 8080
 ```
 
 ## Stopping
 
 ```bash
-cd app && docker compose down
+./vault.sh stop
 ```
 
 ## License
