@@ -94,19 +94,46 @@ async def handle_directory_created(dir_path: Path) -> None:
 async def ensure_collection_exists(collection_name: str) -> None:
     """
     Ensure a collection exists in the database.
-    If not, create it and write the .vault_key file.
+    If .vault_key exists, use that key. Otherwise generate a new one.
     """
     settings = get_settings()
+    key_file = settings.collections_root / collection_name / ".vault_key"
+
+    # Check if .vault_key already exists
+    existing_key = None
+    if key_file.exists():
+        existing_key = key_file.read_text().strip()
 
     async with get_session() as session:
         repo = CollectionRepository(session)
-        _, api_key = await repo.get_or_create(collection_name)
+        _, api_key = await repo.get_or_create(collection_name, api_key=existing_key)
 
-        # If api_key is not None, this is a new collection
-        if api_key is not None:
-            key_file = settings.collections_root / collection_name / ".vault_key"
+        # If api_key is not None, this is a new collection - write the key file
+        if api_key is not None and existing_key is None:
             key_file.write_text(api_key)
             logger.info(f"Created collection '{collection_name}' with API key in {key_file}")
+        elif api_key is not None and existing_key is not None:
+            logger.info(f"Created collection '{collection_name}' using existing .vault_key")
+
+
+async def handle_vault_key_modified(collection_name: str) -> None:
+    """Handle .vault_key file modification - update the API key in database."""
+    settings = get_settings()
+    key_file = settings.collections_root / collection_name / ".vault_key"
+
+    if not key_file.exists():
+        logger.warning(f".vault_key deleted for collection {collection_name}")
+        return
+
+    new_key = key_file.read_text().strip()
+    if not new_key:
+        logger.warning(f".vault_key is empty for collection {collection_name}")
+        return
+
+    async with get_session() as session:
+        repo = CollectionRepository(session)
+        if await repo.update_api_key(collection_name, new_key):
+            logger.info(f"Updated API key for collection '{collection_name}'")
 
 
 async def handle_file_created_or_modified(file_path: Path) -> None:
@@ -206,7 +233,14 @@ class VaultEventHandler(FileSystemEventHandler):
         """Handle file modification events."""
         if event.is_directory:
             return
-        self._run_async(handle_file_created_or_modified(Path(event.src_path)))
+        path = Path(event.src_path)
+        # Handle .vault_key modifications
+        if path.name == ".vault_key":
+            collection_name = parse_collection_dir(path.parent)
+            if collection_name:
+                self._run_async(handle_vault_key_modified(collection_name))
+            return
+        self._run_async(handle_file_created_or_modified(path))
 
     def on_deleted(self, event: FileSystemEvent) -> None:
         """Handle file deletion events."""

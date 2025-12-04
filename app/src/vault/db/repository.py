@@ -65,9 +65,13 @@ class CollectionRepository:
         await self.session.flush()
         return collection
 
-    async def get_or_create(self, name: str) -> tuple[Collection, str | None]:
+    async def get_or_create(self, name: str, api_key: str | None = None) -> tuple[Collection, str | None]:
         """
         Get existing collection or create a new one.
+
+        Args:
+            name: Collection name
+            api_key: Optional API key to use. If None, generates a new one.
 
         Returns:
             Tuple of (collection, api_key). api_key is None if collection already existed.
@@ -76,8 +80,10 @@ class CollectionRepository:
         if existing is not None:
             return existing, None
 
-        # Generate new API key and create
-        api_key = generate_api_key()
+        # Use provided key or generate new one
+        if api_key is None:
+            api_key = generate_api_key()
+
         collection = Collection(
             name=name,
             api_key_hash=hash_api_key(api_key),
@@ -86,6 +92,15 @@ class CollectionRepository:
         self.session.add(collection)
         await self.session.flush()
         return collection, api_key
+
+    async def update_api_key(self, name: str, api_key: str) -> bool:
+        """Update the API key for a collection."""
+        collection = await self.get_by_name(name)
+        if collection is None:
+            return False
+        collection.api_key_hash = hash_api_key(api_key)
+        await self.session.flush()
+        return True
 
     async def verify_api_key(self, name: str, api_key: str) -> bool:
         """Verify an API key for a collection."""
