@@ -2,7 +2,9 @@
 
 import asyncio
 import logging
+import time
 from pathlib import Path
+from typing import Dict
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 
@@ -19,6 +21,13 @@ logger = logging.getLogger(__name__)
 
 # Files to ignore
 IGNORED_FILES = {".vault_key", ".DS_Store"}
+
+# Debouncing: track files being processed and their last event time
+_processing_lock = asyncio.Lock()
+_files_in_progress: Dict[str, float] = {}  # path -> timestamp when processing started
+_last_event_time: Dict[str, float] = {}  # path -> last event timestamp
+DEBOUNCE_SECONDS = 2.0  # Ignore events for same file within this window
+PROCESSING_TIMEOUT = 300.0  # Consider stuck after 5 minutes
 
 
 def should_ignore(path: Path) -> bool:
@@ -151,6 +160,32 @@ async def handle_file_created_or_modified(file_path: Path) -> None:
 
     collection_name, object_name = parsed
     object_key = f"{collection_name}/{object_name}"
+    path_str = str(file_path)
+    now = time.time()
+
+    # Debouncing: check if we should skip this event
+    async with _processing_lock:
+        # Check if file is currently being processed
+        if path_str in _files_in_progress:
+            started_at = _files_in_progress[path_str]
+            if now - started_at < PROCESSING_TIMEOUT:
+                logger.debug(f"Skipping {object_key}: already being processed")
+                return
+            else:
+                # Processing stuck, allow retry
+                logger.warning(f"Processing timeout for {object_key}, allowing retry")
+                del _files_in_progress[path_str]
+
+        # Check debounce window
+        if path_str in _last_event_time:
+            last_time = _last_event_time[path_str]
+            if now - last_time < DEBOUNCE_SECONDS:
+                logger.debug(f"Debouncing {object_key}: event too soon after last")
+                return
+
+        # Mark as in progress
+        _files_in_progress[path_str] = now
+        _last_event_time[path_str] = now
 
     logger.info(f"Processing file: {file_path} -> {object_key}")
 
@@ -180,6 +215,10 @@ async def handle_file_created_or_modified(file_path: Path) -> None:
 
     except Exception as e:
         logger.error(f"Failed to process file {file_path}: {e}", exc_info=True)
+    finally:
+        # Remove from in-progress
+        async with _processing_lock:
+            _files_in_progress.pop(path_str, None)
 
 
 async def handle_file_deleted(file_path: Path) -> None:
@@ -193,6 +232,29 @@ async def handle_file_deleted(file_path: Path) -> None:
 
     collection_name, object_name = parsed
     object_key = f"{collection_name}/{object_name}"
+    path_str = str(file_path)
+    now = time.time()
+
+    # Check if file actually exists - PollingObserver can report false deletions
+    if file_path.exists():
+        logger.debug(f"Ignoring false deletion for {object_key}: file still exists")
+        return
+
+    # Debouncing for deletions
+    async with _processing_lock:
+        # If file is being processed for creation, skip deletion
+        if path_str in _files_in_progress:
+            logger.debug(f"Skipping deletion {object_key}: file is being processed")
+            return
+
+        # Check debounce window
+        if path_str in _last_event_time:
+            last_time = _last_event_time[path_str]
+            if now - last_time < DEBOUNCE_SECONDS:
+                logger.debug(f"Debouncing deletion {object_key}: event too soon")
+                return
+
+        _last_event_time[path_str] = now
 
     logger.info(f"Processing deletion: {object_key}")
 
