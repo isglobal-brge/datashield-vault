@@ -1,6 +1,9 @@
+name: datashield-vault
+
 services:
   minio:
     image: minio/minio:latest
+    container_name: datashield-vault-minio
     command: server /minio-data
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -13,8 +16,9 @@ services:
       timeout: 5s
       retries: 5
 
-  datashield-vault:
+  api:
     build: .
+    container_name: datashield-vault-api
     ports:
       - "${PORT:-8000}:8000"
     environment:
