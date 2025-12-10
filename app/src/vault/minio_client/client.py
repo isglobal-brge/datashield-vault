@@ -2,6 +2,8 @@
 
 import hashlib
 import io
+import logging
+import time
 from collections.abc import Generator
 from pathlib import Path
 
@@ -9,6 +11,13 @@ from minio import Minio
 from minio.error import S3Error
 
 from vault.config import get_settings
+from vault.minio_client.circuit_breaker import (
+    CircuitBreakerError,
+    minio_circuit_breaker,
+)
+from vault.monitoring.metrics import metrics
+
+logger = logging.getLogger(__name__)
 
 _client: Minio | None = None
 
@@ -60,15 +69,36 @@ def upload_file(object_key: str, file_path: Path) -> None:
     Args:
         object_key: The key (path) in MinIO
         file_path: Local path to the file
+
+    Raises:
+        CircuitBreakerError: If MinIO circuit breaker is open
     """
+    # Check circuit breaker first
+    minio_circuit_breaker.check_state()
+
     settings = get_settings()
     client = get_minio_client()
 
-    client.fput_object(
-        settings.minio_bucket,
-        object_key,
-        str(file_path),
-    )
+    start = time.time()
+    try:
+        client.fput_object(
+            settings.minio_bucket,
+            object_key,
+            str(file_path),
+        )
+        # Record success
+        minio_circuit_breaker.record_success()
+        latency = (time.time() - start) * 1000
+        metrics.minio_operation_latency.observe(latency)
+        metrics.minio_uploads_total.inc()
+        logger.debug(f"Uploaded {object_key} in {latency:.1f}ms")
+    except Exception as e:
+        # Record failure for circuit breaker
+        minio_circuit_breaker.record_failure()
+        metrics.minio_upload_errors.inc()
+        metrics.minio_circuit_breaker_state.set(1 if minio_circuit_breaker.is_open else 0)
+        logger.error(f"MinIO upload failed for {object_key}: {e}")
+        raise
 
 
 def delete_object(object_key: str) -> bool:
@@ -80,16 +110,31 @@ def delete_object(object_key: str) -> bool:
 
     Returns:
         True if deleted, False if not found
+
+    Raises:
+        CircuitBreakerError: If MinIO circuit breaker is open
     """
+    # Check circuit breaker first
+    minio_circuit_breaker.check_state()
+
     settings = get_settings()
     client = get_minio_client()
 
+    start = time.time()
     try:
         client.remove_object(settings.minio_bucket, object_key)
+        minio_circuit_breaker.record_success()
+        latency = (time.time() - start) * 1000
+        metrics.minio_operation_latency.observe(latency)
+        metrics.minio_deletes_total.inc()
         return True
     except S3Error as e:
         if e.code == "NoSuchKey":
+            # Not a failure - object just doesn't exist
             return False
+        minio_circuit_breaker.record_failure()
+        metrics.minio_delete_errors.inc()
+        metrics.minio_circuit_breaker_state.set(1 if minio_circuit_breaker.is_open else 0)
         raise
 
 

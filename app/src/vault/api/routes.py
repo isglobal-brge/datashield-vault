@@ -53,9 +53,9 @@ async def list_objects(
 
     Requires X-Collection-Key header.
     """
-    # Wait for sync if timeout > 0
+    # Wait for sync if timeout > 0 - REUSE SESSION to avoid connection pool exhaustion
     if sync_timeout and sync_timeout > 0:
-        sync_state = await wait_for_sync(collection, timeout=sync_timeout)
+        sync_state = await wait_for_sync(collection, timeout=sync_timeout, session=session)
         if not sync_state.is_synced:
             logger.warning(
                 f"list_objects: collection '{collection}' not fully synced after {sync_timeout}s "
@@ -97,9 +97,9 @@ async def list_hashes(
 
     Requires X-Collection-Key header.
     """
-    # Wait for sync if timeout > 0
+    # Wait for sync if timeout > 0 - REUSE SESSION to avoid connection pool exhaustion
     if sync_timeout and sync_timeout > 0:
-        sync_state = await wait_for_sync(collection, timeout=sync_timeout)
+        sync_state = await wait_for_sync(collection, timeout=sync_timeout, session=session)
         if not sync_state.is_synced:
             logger.warning(
                 f"list_hashes: collection '{collection}' not fully synced after {sync_timeout}s "

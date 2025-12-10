@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict
 
@@ -11,11 +12,13 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from vault.config import get_settings
 from vault.db.repository import CollectionRepository, ObjectRepository
 from vault.db.session import get_session
+from vault.minio_client.circuit_breaker import CircuitBreakerError
 from vault.minio_client.client import (
     compute_file_hash,
     delete_object,
     upload_file,
 )
+from vault.monitoring.metrics import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +31,45 @@ _files_in_progress: Dict[str, float] = {}  # path -> timestamp when processing s
 _last_event_time: Dict[str, float] = {}  # path -> last event timestamp
 DEBOUNCE_SECONDS = 2.0  # Ignore events for same file within this window
 PROCESSING_TIMEOUT = 300.0  # Consider stuck after 5 minutes
+
+# Semaphore to limit concurrent file processing operations (prevents DB connection pool exhaustion)
+# For SQLite, we need to keep this low (3) to avoid "database is locked" errors
+# For PostgreSQL/MySQL, this could be higher (10-20)
+_processing_semaphore = asyncio.Semaphore(3)  # Max 3 concurrent file operations for SQLite safety
+SEMAPHORE_TIMEOUT = 60.0  # Max time to wait for semaphore
+_queue_depth = 0  # Track how many are waiting for semaphore
+
+
+@asynccontextmanager
+async def acquire_semaphore_with_timeout(timeout: float = SEMAPHORE_TIMEOUT):
+    """
+    Acquire semaphore with a timeout.
+
+    Raises TimeoutError if semaphore not acquired within timeout.
+    Updates queue depth metrics.
+    """
+    global _queue_depth
+
+    _queue_depth += 1
+    metrics.watcher_semaphore_queue_depth.set(_queue_depth)
+
+    try:
+        acquired = await asyncio.wait_for(
+            _processing_semaphore.acquire(),
+            timeout=timeout,
+        )
+        _queue_depth -= 1
+        metrics.watcher_semaphore_queue_depth.set(_queue_depth)
+
+        try:
+            yield
+        finally:
+            _processing_semaphore.release()
+    except asyncio.TimeoutError:
+        _queue_depth -= 1
+        metrics.watcher_semaphore_queue_depth.set(_queue_depth)
+        metrics.watcher_processing_timeouts.inc()
+        raise
 
 
 def should_ignore(path: Path) -> bool:
@@ -188,34 +230,53 @@ async def handle_file_created_or_modified(file_path: Path) -> None:
         _last_event_time[path_str] = now
 
     logger.info(f"Processing file: {file_path} -> {object_key}")
+    metrics.watcher_files_in_progress.inc()
 
     try:
-        # Ensure collection exists
-        await ensure_collection_exists(collection_name)
+        # Use semaphore with timeout to limit concurrent processing
+        async with acquire_semaphore_with_timeout():
+            try:
+                # Ensure collection exists
+                await ensure_collection_exists(collection_name)
 
-        # Compute hash
-        hash_sha256, size_bytes = compute_file_hash(file_path)
-        logger.debug(f"Computed hash for {object_key}: {hash_sha256}")
+                # Compute hash
+                hash_sha256, size_bytes = compute_file_hash(file_path)
+                logger.debug(f"Computed hash for {object_key}: {hash_sha256}")
 
-        # Upload to MinIO
-        upload_file(object_key, file_path)
-        logger.debug(f"Uploaded {object_key} to MinIO")
+                # Upload to MinIO (this can raise CircuitBreakerError)
+                upload_file(object_key, file_path)
+                logger.debug(f"Uploaded {object_key} to MinIO")
 
-        # Update database
-        async with get_session() as session:
-            repo = ObjectRepository(session)
-            await repo.create_or_replace(
-                collection=collection_name,
-                name=object_name,
-                object_key=object_key,
-                hash_sha256=hash_sha256,
-                size_bytes=size_bytes,
-            )
-            logger.info(f"Registered object: {object_key} (hash: {hash_sha256[:16]}...)")
+                # Update database (only after successful MinIO upload)
+                async with get_session() as session:
+                    repo = ObjectRepository(session)
+                    await repo.create_or_replace(
+                        collection=collection_name,
+                        name=object_name,
+                        object_key=object_key,
+                        hash_sha256=hash_sha256,
+                        size_bytes=size_bytes,
+                    )
+                    logger.info(f"Registered object: {object_key} (hash: {hash_sha256[:16]}...)")
 
-    except Exception as e:
-        logger.error(f"Failed to process file {file_path}: {e}", exc_info=True)
+                # Record success
+                metrics.watcher_files_processed.inc()
+
+            except CircuitBreakerError as e:
+                # MinIO circuit breaker is open - don't fail, retry later
+                logger.warning(f"MinIO circuit breaker open for {object_key}: {e}")
+                metrics.watcher_files_failed.inc()
+
+            except Exception as e:
+                logger.error(f"Failed to process file {file_path}: {e}", exc_info=True)
+                metrics.watcher_files_failed.inc()
+
+    except asyncio.TimeoutError:
+        logger.warning(f"Semaphore timeout for {object_key} after {SEMAPHORE_TIMEOUT}s")
+        metrics.watcher_files_failed.inc()
+
     finally:
+        metrics.watcher_files_in_progress.dec()
         # Remove from in-progress
         async with _processing_lock:
             _files_in_progress.pop(path_str, None)

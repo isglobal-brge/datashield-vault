@@ -11,7 +11,9 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Set
+from typing import Optional, Set
+
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from vault.config import get_settings
 from vault.db.repository import ObjectRepository
@@ -79,12 +81,19 @@ def get_processing_files_for_collection(collection: str) -> Set[str]:
     return processing
 
 
-async def get_sync_state(collection: str) -> SyncState:
+async def get_sync_state(
+    collection: str,
+    session: Optional[AsyncSession] = None,
+) -> SyncState:
     """
     Get the current synchronization state for a collection.
 
     Compares files in the folder with files in the database to determine
     if there are any pending uploads.
+
+    Args:
+        collection: Collection name
+        session: Optional existing database session to reuse (avoids creating new connections)
     """
     # Get files in folder
     folder_files = get_folder_files(collection)
@@ -92,11 +101,16 @@ async def get_sync_state(collection: str) -> SyncState:
     # Get files being processed
     processing_files = get_processing_files_for_collection(collection)
 
-    # Get files in database
-    async with get_session() as session:
+    # Get files in database - reuse session if provided
+    if session is not None:
         repo = ObjectRepository(session)
         db_objects = await repo.list_ready_by_collection(collection)
         db_files = {obj.name for obj in db_objects}
+    else:
+        async with get_session() as new_session:
+            repo = ObjectRepository(new_session)
+            db_objects = await repo.list_ready_by_collection(collection)
+            db_files = {obj.name for obj in db_objects}
 
     # Files in folder but not in DB (and not currently processing)
     pending_files = folder_files - db_files - processing_files
@@ -126,6 +140,7 @@ async def wait_for_sync(
     collection: str,
     timeout: float = DEFAULT_SYNC_TIMEOUT,
     poll_interval: float = SYNC_POLL_INTERVAL,
+    session: Optional[AsyncSession] = None,
 ) -> SyncState:
     """
     Wait for a collection to be fully synchronized.
@@ -134,6 +149,7 @@ async def wait_for_sync(
         collection: Collection name
         timeout: Maximum time to wait in seconds
         poll_interval: How often to check sync status
+        session: Optional existing database session to reuse (avoids creating 60+ connections during polling)
 
     Returns:
         Final SyncState after waiting
@@ -143,7 +159,7 @@ async def wait_for_sync(
     elapsed = 0.0
 
     while elapsed < timeout:
-        state = await get_sync_state(collection)
+        state = await get_sync_state(collection, session=session)
 
         if state.is_synced:
             logger.debug(
@@ -162,7 +178,7 @@ async def wait_for_sync(
         elapsed += poll_interval
 
     # Timeout reached - return final state
-    final_state = await get_sync_state(collection)
+    final_state = await get_sync_state(collection, session=session)
     if not final_state.is_synced:
         logger.warning(
             f"Sync timeout for '{collection}' after {timeout}s: "
