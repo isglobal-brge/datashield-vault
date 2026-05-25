@@ -34,9 +34,23 @@ from dsimaging_admin.manifest import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("controller")
 
-MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "http://minio:9000")
-MINIO_ACCESS_KEY = os.environ.get("MINIO_ROOT_USER", "minioadmin")
-MINIO_SECRET_KEY = os.environ.get("MINIO_ROOT_PASSWORD", "minioadmin123")
+SQS_QUEUE_URL = os.environ.get("DSIMAGING_SQS_QUEUE_URL", "")
+S3_ENDPOINT = os.environ.get("DSIMAGING_S3_ENDPOINT") or os.environ.get(
+    "MINIO_ENDPOINT", "" if SQS_QUEUE_URL else "http://minio:9000"
+)
+S3_ACCESS_KEY = (
+    os.environ.get("DSIMAGING_ACCESS_KEY")
+    or os.environ.get("MINIO_ROOT_USER")
+    or ("" if SQS_QUEUE_URL else "minioadmin")
+)
+S3_SECRET_KEY = (
+    os.environ.get("DSIMAGING_SECRET_KEY")
+    or os.environ.get("MINIO_ROOT_PASSWORD")
+    or ("" if SQS_QUEUE_URL else "minioadmin123")
+)
+AWS_REGION = os.environ.get("DSIMAGING_AWS_REGION") or os.environ.get(
+    "AWS_REGION", "us-east-1"
+)
 BUCKET = os.environ.get("BUCKET_NAME", "imaging-data")
 RECONCILE_INTERVAL_SECONDS = int(os.environ.get("RECONCILE_INTERVAL_SECONDS", "10"))
 PUBLISH_LOCK = ".publish-lock"
@@ -66,13 +80,18 @@ class PublishInProgress(Exception):
 
 def get_s3():
     import boto3
-    return boto3.client(
-        "s3",
-        endpoint_url=MINIO_ENDPOINT,
-        aws_access_key_id=MINIO_ACCESS_KEY,
-        aws_secret_access_key=MINIO_SECRET_KEY,
-        region_name="us-east-1",
-    )
+    kwargs = {"region_name": AWS_REGION}
+    if S3_ENDPOINT:
+        kwargs["endpoint_url"] = S3_ENDPOINT
+    if S3_ACCESS_KEY and S3_SECRET_KEY:
+        kwargs["aws_access_key_id"] = S3_ACCESS_KEY
+        kwargs["aws_secret_access_key"] = S3_SECRET_KEY
+    return boto3.client("s3", **kwargs)
+
+
+def get_sqs():
+    import boto3
+    return boto3.client("sqs", region_name=AWS_REGION)
 
 
 def extract_dataset_id_from_source_key(key):
@@ -91,6 +110,37 @@ def extract_dataset_id_from_source_key(key):
 def mark_dirty(dataset_id):
     with state_lock:
         dirty_datasets.add(dataset_id)
+
+
+def iter_s3_event_records(events):
+    """Yield normalized records from S3/MinIO event JSON."""
+    if isinstance(events, (bytes, bytearray)):
+        events = json.loads(events.decode())
+    elif isinstance(events, str):
+        events = json.loads(events)
+    for record in events.get("Records", []):
+        raw_key = record.get("s3", {}).get("object", {}).get("key", "")
+        if not raw_key:
+            continue
+        yield {
+            "key": unquote_plus(raw_key),
+            "event_name": record.get("eventName", ""),
+        }
+
+
+def handle_s3_event_payload(events):
+    """Mark datasets dirty for source image/mask S3 events."""
+    count = 0
+    for item in iter_s3_event_records(events):
+        dataset_id = extract_dataset_id_from_source_key(item["key"])
+        if dataset_id:
+            log.info(
+                "Event: %s on %s (dataset: %s)",
+                item["event_name"], item["key"], dataset_id,
+            )
+            mark_dirty(dataset_id)
+            count += 1
+    return count
 
 
 def pop_dirty_batch():
@@ -164,16 +214,7 @@ class Handler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
         try:
-            events = json.loads(body)
-            records = events.get("Records", [])
-            for record in records:
-                raw_key = record.get("s3", {}).get("object", {}).get("key", "")
-                key = unquote_plus(raw_key)
-                event_name = record.get("eventName", "")
-                dataset_id = extract_dataset_id_from_source_key(key)
-                if dataset_id:
-                    log.info("Event: %s on %s (dataset: %s)", event_name, key, dataset_id)
-                    mark_dirty(dataset_id)
+            handle_s3_event_payload(body)
         except Exception as e:
             log.exception("Webhook parse error: %s", e)
 
@@ -183,11 +224,13 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b'{"status":"ok"}')
 
     def do_GET(self):
-        if self.path == "/health":
+        if self.path in {"/health", "/healthz"}:
             self.write_json({
                 "status": "ok",
                 "bucket": BUCKET,
-                "minio_endpoint": MINIO_ENDPOINT,
+                "s3_endpoint": S3_ENDPOINT,
+                "aws_region": AWS_REGION,
+                "sqs_enabled": bool(SQS_QUEUE_URL),
                 "webhook_prefix": WEBHOOK_PREFIX,
                 "source_prefixes": SOURCE_PREFIXES,
                 "reconcile_interval_seconds": RECONCILE_INTERVAL_SECONDS,
@@ -280,6 +323,40 @@ def reconcile_loop():
                 record_failure(dataset_id, e)
                 log.exception("Reconcile failed for dataset %s: %s", dataset_id, e)
         time.sleep(RECONCILE_INTERVAL_SECONDS)
+
+
+def sqs_loop():
+    if not SQS_QUEUE_URL:
+        return
+    sqs = get_sqs()
+    log.info("SQS worker enabled: %s", SQS_QUEUE_URL)
+    while True:
+        try:
+            process_sqs_messages(sqs, SQS_QUEUE_URL)
+        except Exception as e:
+            log.exception("SQS worker failed: %s", e)
+            time.sleep(5)
+
+
+def process_sqs_messages(sqs, queue_url, wait_time_seconds=20):
+    """Process one long-poll batch from SQS."""
+    response = sqs.receive_message(
+        QueueUrl=queue_url,
+        MaxNumberOfMessages=10,
+        WaitTimeSeconds=wait_time_seconds,
+    )
+    processed = 0
+    for message in response.get("Messages", []):
+        body = json.loads(message.get("Body", "{}"))
+        if "Message" in body:
+            body = json.loads(body["Message"])
+        handle_s3_event_payload(body)
+        sqs.delete_message(
+            QueueUrl=queue_url,
+            ReceiptHandle=message["ReceiptHandle"],
+        )
+        processed += 1
+    return processed
 
 
 def reconcile_dataset(dataset_id):
@@ -467,9 +544,13 @@ def main():
     port = int(os.environ.get("PORT", "8080"))
     thread = threading.Thread(target=reconcile_loop, daemon=True)
     thread.start()
+    if SQS_QUEUE_URL:
+        sqs_thread = threading.Thread(target=sqs_loop, daemon=True)
+        sqs_thread.start()
     server = HTTPServer(("0.0.0.0", port), Handler)
     log.info("Controller listening on port %s", port)
-    log.info("MinIO: %s, Bucket: %s", MINIO_ENDPOINT, BUCKET)
+    log.info("S3 endpoint: %s, Bucket: %s", S3_ENDPOINT or "<aws-default>", BUCKET)
+    log.info("AWS region: %s", AWS_REGION)
     log.info("Reconcile interval: %ss", RECONCILE_INTERVAL_SECONDS)
     try:
         server.serve_forever()

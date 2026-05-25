@@ -37,21 +37,5 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # One-time init: creates bucket, enables versioning, configures webhooks
-  init:
-    build:
-      context: ./scripts
-      dockerfile: Dockerfile.init
-    environment:
-      MINIO_ENDPOINT: http://minio:9000
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
-      BUCKET_NAME: ${BUCKET_NAME:-imaging-data}
-      WEBHOOK_RETRIES: ${WEBHOOK_RETRIES:-12}
-      WEBHOOK_RETRY_SECONDS: ${WEBHOOK_RETRY_SECONDS:-5}
-    depends_on:
-      minio:
-        condition: service_healthy
-
 volumes:
   minio-data:
