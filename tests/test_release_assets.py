@@ -6,6 +6,7 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+RELEASE_VERSION = "0.3.10"
 
 
 class ReleaseAssetTests(unittest.TestCase):
@@ -51,6 +52,21 @@ class ReleaseAssetTests(unittest.TestCase):
             r"^FROM python:3\.11-slim@sha256:[0-9a-f]{64}$",
         )
         self.assertIn("USER controller:controller", dockerfile)
+
+        compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(
+            f'org.opencontainers.image.version="{RELEASE_VERSION}"',
+            dockerfile,
+        )
+        self.assertIn(
+            f"davidsarrat/dsimaging-store:{RELEASE_VERSION}@sha256:",
+            compose,
+        )
+        self.assertIn(
+            f"docker pull davidsarrat/dsimaging-store:{RELEASE_VERSION}",
+            readme,
+        )
 
     def test_example_env_keeps_digest_pinned_controller_default(self):
         env_lines = (ROOT / ".env.example").read_text(
