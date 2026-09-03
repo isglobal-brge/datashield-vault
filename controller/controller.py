@@ -406,8 +406,10 @@ def reconcile_dataset(dataset_id):
     release_lock = True
     completed = False
     try:
-        objects = list_objects(s3, f"{prefix}/source/images/")
-        mask_objects = list_objects(s3, f"{prefix}/source/masks/")
+        objects = list_objects(
+            s3, f"{prefix}/source/images/", include_version_ids=True)
+        mask_objects = list_objects(
+            s3, f"{prefix}/source/masks/", include_version_ids=True)
         samples = scan_s3_images(s3, prefix, objects)
         masks = scan_s3_masks(
             s3, prefix, mask_objects,
@@ -534,16 +536,22 @@ def delete_current_keys(s3, keys):
     return deleted
 
 
-def list_objects(s3, prefix):
+def list_objects(s3, prefix, *, include_version_ids=False):
     objects = []
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
         for obj in page.get("Contents", []):
+            version_id = None
+            if include_version_ids:
+                version_id = s3.head_object(
+                    Bucket=BUCKET, Key=obj["Key"]
+                ).get("VersionId")
             objects.append({
                 "key": obj["Key"],
                 "size": int(obj["Size"]),
                 "last_modified": obj["LastModified"].isoformat(),
                 "etag": obj.get("ETag", "").strip('"') or None,
+                "version_id": version_id,
             })
     return objects
 
@@ -638,14 +646,19 @@ def build_hash_index(prefix, samples, source_path="images"):
 def source_inventory(objects):
     """Return the stable fields that define one current source roster."""
     return sorted(
-        (obj["key"], int(obj.get("size", 0)), obj.get("etag"))
+        (
+            obj["key"], int(obj.get("size", 0)), obj.get("etag"),
+            obj.get("version_id"),
+        )
         for obj in objects
     )
 
 
 def assert_source_inventory_unchanged(s3, prefix, images, masks):
-    current_images = list_objects(s3, f"{prefix}/source/images/")
-    current_masks = list_objects(s3, f"{prefix}/source/masks/")
+    current_images = list_objects(
+        s3, f"{prefix}/source/images/", include_version_ids=True)
+    current_masks = list_objects(
+        s3, f"{prefix}/source/masks/", include_version_ids=True)
     if (source_inventory(current_images) != source_inventory(images) or
             source_inventory(current_masks) != source_inventory(masks)):
         raise RuntimeError("dataset source roster changed during reconciliation")

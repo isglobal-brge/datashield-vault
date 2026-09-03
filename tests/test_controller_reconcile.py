@@ -69,10 +69,12 @@ class FakeS3:
     def head_object(self, Bucket, Key):
         if Key not in self.objects:
             raise KeyError(Key)
+        digest = hashlib.md5(self.objects[Key]).hexdigest()
         return {
             "ContentLength": len(self.objects[Key]),
             "LastModified": dt.datetime(2026, 5, 13, tzinfo=dt.timezone.utc),
-            "ETag": f'"{hashlib.md5(self.objects[Key]).hexdigest()}"',
+            "ETag": f'"{digest}"',
+            "VersionId": f"version-{digest}",
         }
 
     def get_object(self, Bucket, Key):
@@ -312,6 +314,24 @@ class ReconcileTests(unittest.TestCase):
         self.assertIn(f"{prefix}/manifest.yaml", s3.objects)
         self.assertIn(f"{prefix}/indexes/content_hash_index.parquet", s3.objects)
         self.assertNotIn(stale_mask_index, s3.objects)
+
+    def test_reconcile_records_current_source_version_ids(self):
+        prefix = "datasets/study_ct_v1"
+        image_key = f"{prefix}/source/images/case001.nii.gz"
+        objects = self._published_objects(
+            prefix, [("case001", "patient-a")]
+        )
+        objects[image_key] = b"image"
+        s3 = FakeS3(objects)
+        controller.get_s3 = lambda: s3
+
+        controller.reconcile_dataset("study_ct_v1")
+
+        index = pq.read_table(pa.BufferReader(
+            s3.objects[f"{prefix}/indexes/content_hash_index.parquet"]
+        ))
+        expected = f"version-{hashlib.md5(b'image').hexdigest()}"
+        self.assertEqual(index["version_id"].to_pylist(), [expected])
 
     def test_reconcile_preserves_contract_and_repeated_patient_per_dataset(self):
         prefix_a = "datasets/study_a"
