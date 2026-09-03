@@ -58,7 +58,7 @@ and encryption, creates an SQS queue and wires bucket notifications to it:
 dsimaging-admin --backend aws \
   --region eu-west-1 \
   --bucket my-imaging \
-  store init
+  store init ./aws-store
 ```
 
 Deploy the controller wherever appropriate and set:
