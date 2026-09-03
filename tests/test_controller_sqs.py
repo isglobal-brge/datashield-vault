@@ -2,6 +2,7 @@ import importlib.util
 import json
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -80,6 +81,48 @@ class SqsTests(unittest.TestCase):
 
         self.assertEqual(controller.handle_s3_event_payload(event), 0)
         self.assertEqual(controller.dirty_datasets, set())
+
+    def test_malformed_message_is_discarded_instead_of_wedging_batch(self):
+        sqs = FakeSQS("{not json")
+
+        with self.assertLogs(controller.log, level="WARNING") as captured:
+            processed = controller.process_sqs_messages(
+                sqs, "https://sqs.example/dsimaging", wait_time_seconds=0)
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(
+            sqs.deleted,
+            [("https://sqs.example/dsimaging", "receipt-1")],
+        )
+        self.assertIn("malformed SQS notification", "\n".join(captured.output))
+        self.assertEqual(controller.dirty_datasets, set())
+
+    def test_excessively_nested_message_is_discarded(self):
+        sqs = FakeSQS("[" * 2000 + "]" * 2000)
+
+        with self.assertLogs(controller.log, level="WARNING"):
+            processed = controller.process_sqs_messages(
+                sqs, "https://sqs.example/dsimaging", wait_time_seconds=0)
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(
+            sqs.deleted,
+            [("https://sqs.example/dsimaging", "receipt-1")],
+        )
+
+    def test_transient_processing_failure_keeps_message_for_retry(self):
+        sqs = FakeSQS(json.dumps({"Records": []}))
+
+        with patch.object(
+                controller, "handle_s3_event_payload",
+                side_effect=RuntimeError("temporary failure")):
+            with self.assertRaisesRegex(RuntimeError, "temporary failure"):
+                controller.process_sqs_messages(
+                    sqs, "https://sqs.example/dsimaging",
+                    wait_time_seconds=0,
+                )
+
+        self.assertEqual(sqs.deleted, [])
 
 
 if __name__ == "__main__":

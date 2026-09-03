@@ -58,6 +58,7 @@ AWS_REGION = os.environ.get("DSIMAGING_AWS_REGION") or os.environ.get(
 BUCKET = os.environ.get("BUCKET_NAME", "imaging-data")
 RECONCILE_INTERVAL_SECONDS = int(os.environ.get("RECONCILE_INTERVAL_SECONDS", "10"))
 OPERATOR_TOKEN = os.environ.get("DSIMAGING_CONTROLLER_TOKEN", "").strip()
+WEBHOOK_TOKEN = os.environ.get("DSIMAGING_WEBHOOK_TOKEN", "").strip()
 MAX_WEBHOOK_BODY_BYTES = int(os.environ.get(
     "DSIMAGING_MAX_WEBHOOK_BODY_BYTES", str(1024 * 1024)))
 PUBLISH_LOCK = ".publish-lock"
@@ -202,6 +203,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/webhook/minio":
             self.write_error(404, "not found")
             return
+        if not self.require_webhook():
+            return
 
         try:
             content_length = int(self.headers.get("Content-Length", 0))
@@ -262,14 +265,34 @@ class Handler(BaseHTTPRequestHandler):
             self.write_error(404, "not found")
             return False
         value = self.headers.get("Authorization", "")
-        expected = f"Bearer {OPERATOR_TOKEN}"
-        if not hmac.compare_digest(value, expected):
+        if not bearer_matches(value, OPERATOR_TOKEN):
+            self.write_error(403, "forbidden")
+            return False
+        return True
+
+    def require_webhook(self):
+        if not WEBHOOK_TOKEN:
+            self.write_error(404, "not found")
+            return False
+        value = self.headers.get("Authorization", "")
+        if not bearer_matches(value, WEBHOOK_TOKEN):
             self.write_error(403, "forbidden")
             return False
         return True
 
     def log_message(self, fmt, *args):
         pass
+
+
+def bearer_matches(value, token):
+    """Compare bearer credentials without rejecting non-ASCII input noisily."""
+    if not isinstance(value, str) or not isinstance(token, str):
+        return False
+    try:
+        return hmac.compare_digest(
+            value.encode("utf-8"), f"Bearer {token}".encode("utf-8"))
+    except UnicodeEncodeError:
+        return False
 
 
 def list_datasets():
@@ -356,10 +379,16 @@ def process_sqs_messages(sqs, queue_url, wait_time_seconds=20):
     )
     processed = 0
     for message in response.get("Messages", []):
-        body = json.loads(message.get("Body", "{}"))
-        if "Message" in body:
-            body = json.loads(body["Message"])
-        handle_s3_event_payload(body)
+        try:
+            body = json.loads(message.get("Body", "{}"))
+            if "Message" in body:
+                body = json.loads(body["Message"])
+            handle_s3_event_payload(body)
+        except (AttributeError, KeyError, RecursionError, TypeError, ValueError,
+                json.JSONDecodeError):
+            # A malformed notification is not transient. Delete it so one
+            # poison message cannot wedge the event consumer indefinitely.
+            log.warning("Discarding malformed SQS notification")
         sqs.delete_message(
             QueueUrl=queue_url,
             ReceiptHandle=message["ReceiptHandle"],
@@ -548,6 +577,7 @@ def write_dataset_artifacts(s3, prefix, dataset_id, samples, masks=None, *,
                                samples, extra_metadata,
                                privacy_unit_col=contract["privacy_unit_col"],
                                label_col=contract.get("label_col"),
+                               label_levels=contract.get("label_levels"),
                            ))),
             ("manifest.yaml",
              write_yaml(tmpdir, "manifest.yaml",
@@ -557,6 +587,7 @@ def write_dataset_artifacts(s3, prefix, dataset_id, samples, masks=None, *,
                             has_masks=bool(masks),
                             privacy_unit_col=contract["privacy_unit_col"],
                             label_col=contract.get("label_col"),
+                            label_levels=contract.get("label_levels"),
                             existing_manifest=existing_manifest,
                         ))),
         ]
@@ -625,10 +656,12 @@ def build_sample_manifests(samples):
 
 
 def build_samples_metadata(samples, extra_metadata=None, *,
-                           privacy_unit_col, label_col=None):
+                           privacy_unit_col, label_col=None,
+                           label_levels=None):
     return core_build_samples_metadata(
         samples, extra_metadata=extra_metadata,
         privacy_unit_col=privacy_unit_col, label_col=label_col,
+        label_levels=label_levels,
     )
 
 
@@ -654,11 +687,12 @@ def read_existing_samples_metadata(s3, prefix):
 
 
 def generate_manifest(dataset_id, prefix, modality, has_masks=False, *,
-                      privacy_unit_col, label_col=None,
+                      privacy_unit_col, label_col=None, label_levels=None,
                       existing_manifest=None):
     return core_generate_manifest(
         dataset_id, BUCKET, prefix, modality=modality, has_masks=has_masks,
         privacy_unit_col=privacy_unit_col, label_col=label_col,
+        label_levels=label_levels,
         existing_manifest=existing_manifest,
     )
 

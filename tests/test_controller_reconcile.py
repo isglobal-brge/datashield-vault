@@ -320,6 +320,8 @@ class ReconcileTests(unittest.TestCase):
             prefix_a,
             [("case001", "patient-a"), ("case002", "patient-a")],
             title="curated title",
+            labels=["case", "case"],
+            label_levels=["case", "control"],
         )
         objects.update(self._published_objects(
             prefix_b, [("case101", "patient-b")], title="other dataset"
@@ -344,10 +346,13 @@ class ReconcileTests(unittest.TestCase):
             manifest["metadata"]["privacy_unit_canonicalization"],
             "trim-utf8-v2",
         )
+        self.assertEqual(
+            manifest["metadata"]["label_levels"], ["case", "control"])
         table = pq.read_table(pa.BufferReader(
             s3.objects[f"{prefix_a}/metadata/samples.parquet"]
         ))
         self.assertEqual(table["patient_id"].to_pylist(), ["patient-a", "patient-a"])
+        self.assertEqual(table["diagnosis"].to_pylist(), ["case", "case"])
         for key, value in untouched_b.items():
             if key.startswith(f"{prefix_b}/"):
                 self.assertEqual(s3.objects[key], value)
@@ -431,19 +436,44 @@ class ReconcileTests(unittest.TestCase):
             s3.objects[f"{prefix}/metadata/samples.parquet"], b"not parquet"
         )
 
-    def _published_objects(self, prefix, rows, title=None):
+    def test_reconcile_rejects_public_label_level_matching_patient_id(self):
+        prefix = "datasets/study_ct_v1"
+        objects = self._published_objects(
+            prefix,
+            [("case001", "patient-a")],
+            labels=["case"],
+            label_levels=["case", "patient-a"],
+        )
+        objects[f"{prefix}/source/images/case001.nii.gz"] = b"image"
+        before = dict(objects)
+        s3 = FakeS3(objects)
+        controller.get_s3 = lambda: s3
+
+        with self.assertRaisesRegex(
+                ValueError, "must not equal sample or patient identifiers"):
+            controller.reconcile_dataset("study_ct_v1")
+
+        self.assertEqual(s3.objects, before)
+
+    def _published_objects(self, prefix, rows, title=None, *, labels=None,
+                           label_levels=None):
         dataset_id = prefix.rsplit("/", 1)[-1]
+        label_col = "diagnosis" if labels is not None else None
         manifest = controller.generate_manifest(
-            dataset_id, prefix, "ct", privacy_unit_col="patient_id"
+            dataset_id, prefix, "ct", privacy_unit_col="patient_id",
+            label_col=label_col, label_levels=label_levels,
         )
         if title:
             manifest["title"] = title
-        table = pa.table({
+        columns = {
             "sample_id": [sample_id for sample_id, _ in rows],
             "source_kind": ["single_file"] * len(rows),
             "n_files": pa.array([1] * len(rows), type=pa.int32()),
             "patient_id": [patient_id for _, patient_id in rows],
-        })
+        }
+        if labels is not None:
+            columns["diagnosis"] = labels
+        table = pa.table(columns)
         sink = pa.BufferOutputStream()
         pq.write_table(table, sink)
         return {

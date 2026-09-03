@@ -18,9 +18,11 @@ SPEC.loader.exec_module(controller)
 class ControllerHttpTests(unittest.TestCase):
     def setUp(self):
         self.old_token = controller.OPERATOR_TOKEN
+        self.old_webhook_token = controller.WEBHOOK_TOKEN
         self.old_limit = controller.MAX_WEBHOOK_BODY_BYTES
         self.old_bucket = controller.BUCKET
         controller.OPERATOR_TOKEN = ""
+        controller.WEBHOOK_TOKEN = "webhook-token"
         controller.MAX_WEBHOOK_BODY_BYTES = 1024 * 1024
         controller.dirty_datasets.clear()
         controller.last_reconcile.clear()
@@ -36,6 +38,7 @@ class ControllerHttpTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
         controller.OPERATOR_TOKEN = self.old_token
+        controller.WEBHOOK_TOKEN = self.old_webhook_token
         controller.MAX_WEBHOOK_BODY_BYTES = self.old_limit
         controller.BUCKET = self.old_bucket
         controller.dirty_datasets.clear()
@@ -120,7 +123,8 @@ class ControllerHttpTests(unittest.TestCase):
     def test_webhook_body_is_bounded_and_response_is_generic(self):
         controller.MAX_WEBHOOK_BODY_BYTES = 8
         status, payload = self.request(
-            "POST", "/webhook/minio", body=b"0123456789")
+            "POST", "/webhook/minio", token="webhook-token",
+            body=b"0123456789")
 
         self.assertEqual(status, 413)
         self.assertEqual(payload, {"error": "request too large"})
@@ -136,12 +140,33 @@ class ControllerHttpTests(unittest.TestCase):
         }).encode("utf-8")
 
         status, payload = self.request(
-            "POST", "/webhook/minio", body=event)
+            "POST", "/webhook/minio", token="webhook-token", body=event)
 
         self.assertEqual(status, 200)
         self.assertEqual(payload, {"status": "ok"})
         self.assertNotIn("study", json.dumps(payload))
         self.assertIn("study", controller.dirty_datasets)
+
+    def test_webhook_requires_its_dedicated_bearer(self):
+        event = json.dumps({"Records": []}).encode("utf-8")
+
+        missing_status, missing = self.request(
+            "POST", "/webhook/minio", body=event)
+        wrong_status, wrong = self.request(
+            "POST", "/webhook/minio", token="wrong", body=event)
+        non_ascii_status, non_ascii = self.request(
+            "POST", "/webhook/minio", token="é", body=event)
+        allowed_status, allowed = self.request(
+            "POST", "/webhook/minio", token="webhook-token", body=event)
+
+        self.assertEqual(
+            (missing_status, wrong_status, non_ascii_status, allowed_status),
+            (403, 403, 403, 200),
+        )
+        self.assertEqual(missing, {"error": "forbidden"})
+        self.assertEqual(wrong, {"error": "forbidden"})
+        self.assertEqual(non_ascii, {"error": "forbidden"})
+        self.assertEqual(allowed, {"status": "ok"})
 
 
 if __name__ == "__main__":

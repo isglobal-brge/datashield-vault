@@ -11,6 +11,7 @@ services:
       # Webhook notification for controller
       MINIO_NOTIFY_WEBHOOK_ENABLE_DSIMAGING: "on"
       MINIO_NOTIFY_WEBHOOK_ENDPOINT_DSIMAGING: "http://controller:8080/webhook/minio"
+      MINIO_NOTIFY_WEBHOOK_AUTH_TOKEN_DSIMAGING: "Bearer ${DSIMAGING_WEBHOOK_TOKEN:?DSIMAGING_WEBHOOK_TOKEN is required}"
     volumes:
       - minio-data:/data
     healthcheck:
@@ -31,6 +32,7 @@ services:
       BUCKET_NAME: ${BUCKET_NAME:-imaging-data}
       RECONCILE_INTERVAL_SECONDS: ${RECONCILE_INTERVAL_SECONDS:-10}
       DSIMAGING_CONTROLLER_TOKEN: ${DSIMAGING_CONTROLLER_TOKEN:-}
+      DSIMAGING_WEBHOOK_TOKEN: ${DSIMAGING_WEBHOOK_TOKEN:?DSIMAGING_WEBHOOK_TOKEN is required}
       DSIMAGING_MAX_WEBHOOK_BODY_BYTES: ${DSIMAGING_MAX_WEBHOOK_BODY_BYTES:-1048576}
     depends_on:
       minio:
