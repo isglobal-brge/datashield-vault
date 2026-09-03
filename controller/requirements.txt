@@ -1,4 +1,4 @@
-boto3>=1.28.0
+boto3>=1.36.0
 pyarrow>=14.0.0
 pyyaml>=6.0
-dsimaging-admin>=0.3.5
+dsimaging-admin @ https://github.com/isglobal-brge/dsimaging-admin/archive/74a2a85cddcebab367c8a80138203363cd89d4e5.tar.gz

@@ -58,15 +58,27 @@ unless a deployment wires events to it.
 | `minio` | Local S3-compatible object storage | 9000 API, 9001 console |
 | `controller` | Webhook receiver, SQS worker and index reconciler | 8080 |
 
+The local Compose project publishes the controller port on `127.0.0.1` only;
+MinIO reaches its webhook over the internal Compose network. AWS deployments
+may expose the controller according to their operator-network policy.
+
 ## Controller API
 
-- `GET /healthz` and `GET /health`
-- `GET /datasets`
-- `POST /reconcile/<dataset-id>`
+- `GET /healthz` and `GET /health` return only coarse liveness.
+- `GET /datasets` requires the operator bearer token.
+- `POST /reconcile/<dataset-id>` requires the operator bearer token and returns
+  only coarse completion state.
 - `POST /webhook/minio`
 
-`POST /reconcile/<dataset-id>` is available in all deployments as a manual
-pull-based safety net.
+Set `DSIMAGING_CONTROLLER_TOKEN` to a long random value to enable the inventory
+and manual reconcile endpoints, then send `Authorization: Bearer <token>`. When
+the token is empty those two endpoints are disabled. External responses never
+include reconciliation counts or backend error text; details remain in
+controller logs. The background loop continues to reconcile datasets marked
+dirty by events independently of these operator endpoints.
+
+Webhook bodies are capped by `DSIMAGING_MAX_WEBHOOK_BODY_BYTES` (1 MiB by
+default), and webhook responses never echo object or dataset names.
 
 ## Reconcile behaviour
 
@@ -84,7 +96,16 @@ It rebuilds:
 - `manifest.yaml`
 
 `dsimaging-admin dataset publish` writes a `.publish-lock` while uploading. The
-controller defers reconcile while that lock exists.
+controller defers reconcile while that lock exists and conditionally creates an
+owned lock for its own reconciliation. It requires the existing manifest to pin
+`id_col=sample_id`, `privacy_unit=patient`, a `privacy_unit_col`, and
+`privacy_unit_canonicalization=trim-utf8-v2` (plus an optional `label_col`). It
+preserves that contract and other manifest fields, rejects duplicate sample IDs,
+and fails closed on missing, corrupt, duplicate, or incomplete metadata instead
+of replacing it with a reduced table. Derived files are validated before upload,
+the source roster is rechecked before the manifest is uploaded last, and previous
+derived files are restored when a mid-upload failure can be rolled back. A
+controller only removes the lock instance it acquired itself.
 
 ## Configuration
 
@@ -102,3 +123,5 @@ controller defers reconcile while that lock exists.
 | `DSIMAGING_SQS_QUEUE_URL` | unset | Enables AWS SQS worker |
 | `DSIMAGING_AWS_REGION` | `us-east-1` | AWS region |
 | `RECONCILE_INTERVAL_SECONDS` | `10` | Dirty dataset reconcile loop delay |
+| `DSIMAGING_CONTROLLER_TOKEN` | unset | Enables bearer-authenticated inventory and manual reconcile |
+| `DSIMAGING_MAX_WEBHOOK_BODY_BYTES` | `1048576` | Maximum accepted MinIO webhook body |

@@ -66,6 +66,19 @@ class SqsTests(unittest.TestCase):
 
         self.assertIn("lung_ct", controller.dirty_datasets)
 
+    def test_event_with_invalid_dataset_id_is_ignored(self):
+        event = {
+            "Records": [{
+                "eventName": "ObjectCreated:Put",
+                "s3": {"object": {
+                    "key": "datasets/../source/images/case001.nii.gz",
+                }},
+            }]
+        }
+
+        self.assertEqual(controller.handle_s3_event_payload(event), 0)
+        self.assertEqual(controller.dirty_datasets, set())
+
 
 if __name__ == "__main__":
     unittest.main()

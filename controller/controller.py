@@ -9,12 +9,14 @@ converge to the same layout produced by dsimaging-admin publish/rescan.
 """
 
 import json
+import hmac
 import logging
 import os
 import re
 import tempfile
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote_plus
 
@@ -27,6 +29,7 @@ from dsimaging_admin.manifest import (
     build_sample_manifests as core_build_sample_manifests,
     build_samples_metadata as core_build_samples_metadata,
     generate_manifest as core_generate_manifest,
+    metadata_contract_from_manifest,
     scan_s3_images as core_scan_s3_images,
     scan_s3_masks as core_scan_s3_masks,
 )
@@ -53,12 +56,10 @@ AWS_REGION = os.environ.get("DSIMAGING_AWS_REGION") or os.environ.get(
 )
 BUCKET = os.environ.get("BUCKET_NAME", "imaging-data")
 RECONCILE_INTERVAL_SECONDS = int(os.environ.get("RECONCILE_INTERVAL_SECONDS", "10"))
+OPERATOR_TOKEN = os.environ.get("DSIMAGING_CONTROLLER_TOKEN", "").strip()
+MAX_WEBHOOK_BODY_BYTES = int(os.environ.get(
+    "DSIMAGING_MAX_WEBHOOK_BODY_BYTES", str(1024 * 1024)))
 PUBLISH_LOCK = ".publish-lock"
-WEBHOOK_PREFIX = "datasets/"
-SOURCE_PREFIXES = [
-    "datasets/<dataset_id>/source/images/",
-    "datasets/<dataset_id>/source/masks/",
-]
 MANAGED_ARTIFACTS = (
     "manifest.yaml",
     "indexes/content_hash_index.parquet",
@@ -76,6 +77,14 @@ last_errors = {}
 
 class PublishInProgress(Exception):
     """Raised when a dataset has an active publish lock."""
+
+
+class RecoveryIncomplete(Exception):
+    """Raised when previous managed artifacts could not be restored."""
+
+
+class LockOwnershipLost(Exception):
+    """Raised when this reconciliation no longer owns its dataset lock."""
 
 
 def get_s3():
@@ -102,6 +111,7 @@ def extract_dataset_id_from_source_key(key):
         and parts[0] == "datasets"
         and parts[2] == "source"
         and parts[3] in {"images", "masks"}
+        and DATASET_ID_RE.fullmatch(parts[1])
     ):
         return parts[1]
     return None
@@ -172,92 +182,93 @@ def record_failure(dataset_id, error):
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path.startswith("/reconcile/"):
+            if not self.require_operator():
+                return
             dataset_id = self.path.split("/reconcile/", 1)[1]
-            if not DATASET_ID_RE.match(dataset_id or ""):
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": "invalid dataset_id"}).encode())
+            if not DATASET_ID_RE.fullmatch(dataset_id or ""):
+                self.write_error(400, "invalid request")
                 return
             try:
                 n_samples, n_masks = reconcile_dataset(dataset_id)
                 record_success(dataset_id, n_samples, n_masks)
-                self.write_json({
-                    "status": "ok",
-                    "dataset_id": dataset_id,
-                    "samples": n_samples,
-                    "masks": n_masks,
-                })
+                self.write_json({"status": "ok"})
             except PublishInProgress:
                 mark_dirty(dataset_id)
-                self.send_response(409)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({
-                    "status": "locked",
-                    "dataset_id": dataset_id,
-                    "error": "publish in progress",
-                }).encode())
+                self.write_error(409, "busy")
             except Exception as e:
                 record_failure(dataset_id, e)
-                self.send_response(500)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
+                log.exception("Manual reconciliation failed")
+                self.write_error(500, "reconciliation failed")
             return
 
         if self.path != "/webhook/minio":
-            self.send_response(404)
-            self.end_headers()
+            self.write_error(404, "not found")
             return
 
-        content_length = int(self.headers.get("Content-Length", 0))
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self.write_error(400, "invalid request")
+            return
+        if content_length < 0 or content_length > MAX_WEBHOOK_BODY_BYTES:
+            self.close_connection = True
+            self.write_error(413, "request too large")
+            return
         body = self.rfile.read(content_length)
         try:
             handle_s3_event_payload(body)
-        except Exception as e:
-            log.exception("Webhook parse error: %s", e)
+        except Exception:
+            log.exception("Webhook event could not be parsed")
+            self.write_error(400, "invalid request")
+            return
 
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b'{"status":"ok"}')
+        self.write_json({"status": "ok"})
 
     def do_GET(self):
         if self.path in {"/health", "/healthz"}:
-            self.write_json({
-                "status": "ok",
-                "bucket": BUCKET,
-                "s3_endpoint": S3_ENDPOINT,
-                "aws_region": AWS_REGION,
-                "sqs_enabled": bool(SQS_QUEUE_URL),
-                "webhook_prefix": WEBHOOK_PREFIX,
-                "source_prefixes": SOURCE_PREFIXES,
-                "reconcile_interval_seconds": RECONCILE_INTERVAL_SECONDS,
-                "dirty_datasets": sorted_snapshot(dirty_datasets),
-                "last_reconcile": snapshot(last_reconcile),
-                "last_errors": snapshot(last_errors),
-            })
+            self.write_json({"status": "ok"})
             return
 
         if self.path == "/datasets":
+            if not self.require_operator():
+                return
             try:
                 self.write_json({"datasets": list_datasets()})
-            except Exception as e:
-                self.send_response(500)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
+            except Exception:
+                log.exception("Dataset inventory could not be listed")
+                self.write_error(500, "inventory unavailable")
             return
 
-        self.send_response(404)
-        self.end_headers()
+        self.write_error(404, "not found")
 
     def write_json(self, payload):
+        body = json.dumps(payload, sort_keys=True).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(json.dumps(payload, sort_keys=True).encode())
+        self.wfile.write(body)
+
+    def write_error(self, status, message):
+        body = json.dumps({"error": message}).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def require_operator(self):
+        if not OPERATOR_TOKEN:
+            self.write_error(404, "not found")
+            return False
+        value = self.headers.get("Authorization", "")
+        expected = f"Bearer {OPERATOR_TOKEN}"
+        if not hmac.compare_digest(value, expected):
+            self.write_error(403, "forbidden")
+            return False
+        return True
 
     def log_message(self, fmt, *args):
         pass
@@ -275,6 +286,8 @@ def list_datasets():
     for page in paginator.paginate(Bucket=BUCKET, Prefix="datasets/", Delimiter="/"):
         for cp in page.get("CommonPrefixes", []):
             dataset_id = cp["Prefix"].strip("/").split("/")[-1]
+            if not DATASET_ID_RE.fullmatch(dataset_id):
+                continue
             if not prefix_has_current_objects(s3, f"datasets/{dataset_id}/"):
                 continue
             has_manifest = object_exists(s3, f"datasets/{dataset_id}/manifest.yaml")
@@ -282,8 +295,9 @@ def list_datasets():
                 "dataset_id": dataset_id,
                 "status": "published" if has_manifest else "incomplete",
                 "dirty": dataset_id in dirty,
-                "last_reconcile": reconcile_snapshot.get(dataset_id),
-                "last_error": error_snapshot.get(dataset_id),
+                "last_reconcile_at": (
+                    reconcile_snapshot.get(dataset_id) or {}).get("at"),
+                "has_error": dataset_id in error_snapshot,
             })
     return datasets
 
@@ -362,35 +376,122 @@ def process_sqs_messages(sqs, queue_url, wait_time_seconds=20):
 def reconcile_dataset(dataset_id):
     s3 = get_s3()
     prefix = f"datasets/{dataset_id}"
-    if object_exists(s3, f"{prefix}/{PUBLISH_LOCK}"):
-        raise PublishInProgress()
-    objects = list_objects(s3, f"{prefix}/source/images/")
-    mask_objects = list_objects(s3, f"{prefix}/source/masks/")
-    samples = scan_s3_images(s3, prefix, objects)
-    masks = scan_s3_masks(
-        s3, prefix, mask_objects,
-        sample_ids=[sample["sample_id"] for sample in samples],
-    )
-    if not samples:
-        deleted = delete_dataset_artifacts(s3, prefix)
-        if deleted:
-            log.info(
-                "Removed %s managed artifact(s) for dataset %s because no source images remain",
-                deleted,
-                dataset_id,
-            )
-        return 0, len(masks)
-    write_dataset_artifacts(s3, prefix, dataset_id, samples, masks)
-    return len(samples), len(masks)
+    publish_lock = acquire_publish_lock(s3, prefix)
+    release_lock = True
+    completed = False
+    try:
+        objects = list_objects(s3, f"{prefix}/source/images/")
+        mask_objects = list_objects(s3, f"{prefix}/source/masks/")
+        samples = scan_s3_images(s3, prefix, objects)
+        masks = scan_s3_masks(
+            s3, prefix, mask_objects,
+            sample_ids=[sample["sample_id"] for sample in samples],
+        )
+        if not samples:
+            manifest = read_existing_manifest(s3, prefix)
+            metadata_contract_from_manifest(manifest)
+            read_existing_samples_metadata(s3, prefix)
+            assert_source_inventory_unchanged(
+                s3, prefix, objects, mask_objects)
+            assert_publish_lock_owned(s3, publish_lock)
+            deleted = delete_dataset_artifacts(s3, prefix)
+            if deleted:
+                log.info(
+                    "Removed %s managed artifact(s) for dataset %s because no source images remain",
+                    deleted,
+                    dataset_id,
+                )
+            completed = True
+            return 0, len(masks)
+        write_dataset_artifacts(
+            s3, prefix, dataset_id, samples, masks,
+            expected_images=objects, expected_masks=mask_objects,
+            publish_lock=publish_lock,
+        )
+        completed = True
+        return len(samples), len(masks)
+    except RecoveryIncomplete:
+        release_lock = False
+        raise
+    finally:
+        if release_lock:
+            released = release_publish_lock(s3, publish_lock)
+            if completed and not released:
+                raise LockOwnershipLost(
+                    "dataset reconciliation lock ownership was lost")
+
+
+def acquire_publish_lock(s3, prefix):
+    owner = uuid.uuid4().hex
+    key = f"{prefix}/{PUBLISH_LOCK}"
+    try:
+        response = s3.put_object(
+            Bucket=BUCKET, Key=key,
+            Body=json.dumps({
+                "status": "reconciling", "owner": owner,
+            }).encode("utf-8"),
+            ContentType="application/json", IfNoneMatch="*",
+        )
+    except Exception:
+        if object_exists(s3, key):
+            raise PublishInProgress()
+        raise
+    return {"key": key, "owner": owner, "etag": response.get("ETag")}
+
+
+def release_publish_lock(s3, publish_lock):
+    if not publish_lock_is_owned(s3, publish_lock):
+        return False
+    key = publish_lock["key"]
+    kwargs = {"Bucket": BUCKET, "Key": key}
+    if publish_lock.get("etag"):
+        kwargs["IfMatch"] = publish_lock["etag"]
+    try:
+        s3.delete_object(**kwargs)
+    except Exception:
+        return False
+    return True
+
+
+def publish_lock_is_owned(s3, publish_lock):
+    key = publish_lock["key"]
+    try:
+        response = s3.get_object(Bucket=BUCKET, Key=key)
+        body = response["Body"]
+        try:
+            current = json.loads(body.read())
+        finally:
+            body.close()
+    except Exception:
+        return False
+    return current.get("owner") == publish_lock["owner"]
+
+
+def assert_publish_lock_owned(s3, publish_lock):
+    if not publish_lock_is_owned(s3, publish_lock):
+        raise LockOwnershipLost("dataset reconciliation lock ownership was lost")
 
 
 def delete_dataset_artifacts(s3, prefix):
+    previous = snapshot_dataset_artifacts(s3, prefix)
     keys = [
         f"{prefix}/{suffix}"
         for suffix in MANAGED_ARTIFACTS
         if object_exists(s3, f"{prefix}/{suffix}")
     ]
-    return delete_current_keys(s3, keys)
+    try:
+        deleted = delete_current_keys(s3, keys)
+        if deleted != len(keys):
+            raise RuntimeError("managed artifact deletion was incomplete")
+    except Exception:
+        try:
+            restore_dataset_artifacts(s3, prefix, previous)
+        except Exception as recovery_error:
+            raise RecoveryIncomplete(
+                "previous managed artifacts could not be restored"
+            ) from recovery_error
+        raise
+    return deleted
 
 
 def delete_current_keys(s3, keys):
@@ -429,8 +530,11 @@ def scan_s3_masks(s3, prefix, objects, sample_ids=None):
     return core_scan_s3_masks(s3, BUCKET, prefix, objects, sample_ids=sample_ids)
 
 
-def write_dataset_artifacts(s3, prefix, dataset_id, samples, masks=None):
-    modality = existing_modality(s3, prefix, fallback="unknown")
+def write_dataset_artifacts(s3, prefix, dataset_id, samples, masks=None, *,
+                            expected_images=None, expected_masks=None,
+                            publish_lock=None):
+    existing_manifest = read_existing_manifest(s3, prefix)
+    contract = metadata_contract_from_manifest(existing_manifest)
     extra_metadata = read_existing_samples_metadata(s3, prefix)
     masks = masks or []
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -443,11 +547,21 @@ def write_dataset_artifacts(s3, prefix, dataset_id, samples, masks=None):
                            build_sample_manifests(samples))),
             ("metadata/samples.parquet",
              write_parquet(tmpdir, "samples.parquet",
-                           build_samples_metadata(samples, extra_metadata))),
+                           build_samples_metadata(
+                               samples, extra_metadata,
+                               privacy_unit_col=contract["privacy_unit_col"],
+                               label_col=contract.get("label_col"),
+                           ))),
             ("manifest.yaml",
              write_yaml(tmpdir, "manifest.yaml",
-                        generate_manifest(dataset_id, prefix, modality,
-                                          has_masks=bool(masks)))),
+                        generate_manifest(
+                            dataset_id, prefix,
+                            existing_manifest.get("modality") or "unknown",
+                            has_masks=bool(masks),
+                            privacy_unit_col=contract["privacy_unit_col"],
+                            label_col=contract.get("label_col"),
+                            existing_manifest=existing_manifest,
+                        ))),
         ]
         if masks:
             uploads.append(
@@ -455,49 +569,151 @@ def write_dataset_artifacts(s3, prefix, dataset_id, samples, masks=None):
                  write_parquet(tmpdir, "masks_content_hash_index.parquet",
                                build_hash_index(prefix, masks, source_path="masks")))
             )
-        for rel_key, path in uploads:
+        # Generate and validate everything before changing the published set.
+        # Upload the manifest last and restore the prior derived objects if an
+        # upload fails midway.
+        previous = snapshot_dataset_artifacts(s3, prefix)
+        manifest_upload = uploads.pop(3)
+        try:
+            if publish_lock is not None:
+                assert_publish_lock_owned(s3, publish_lock)
+            for rel_key, path in uploads:
+                s3.upload_file(path, BUCKET, f"{prefix}/{rel_key}")
+            if not masks:
+                mask_index_key = f"{prefix}/indexes/masks_content_hash_index.parquet"
+                if object_exists(s3, mask_index_key):
+                    if delete_current_keys(s3, [mask_index_key]) != 1:
+                        raise RuntimeError("stale mask index could not be removed")
+            if expected_images is not None and expected_masks is not None:
+                assert_source_inventory_unchanged(
+                    s3, prefix, expected_images, expected_masks)
+            if publish_lock is not None:
+                assert_publish_lock_owned(s3, publish_lock)
+            rel_key, path = manifest_upload
             s3.upload_file(path, BUCKET, f"{prefix}/{rel_key}")
-        if not masks:
-            mask_index_key = f"{prefix}/indexes/masks_content_hash_index.parquet"
-            if object_exists(s3, mask_index_key):
-                delete_current_keys(s3, [mask_index_key])
+        except LockOwnershipLost:
+            raise
+        except Exception:
+            try:
+                restore_dataset_artifacts(s3, prefix, previous)
+            except Exception as recovery_error:
+                raise RecoveryIncomplete(
+                    "previous managed artifacts could not be restored"
+                ) from recovery_error
+            raise
 
 
 def build_hash_index(prefix, samples, source_path="images"):
     return core_build_hash_index(samples, BUCKET, prefix, source_path=source_path)
 
 
+def source_inventory(objects):
+    """Return the stable fields that define one current source roster."""
+    return sorted(
+        (obj["key"], int(obj.get("size", 0)), obj.get("etag"))
+        for obj in objects
+    )
+
+
+def assert_source_inventory_unchanged(s3, prefix, images, masks):
+    current_images = list_objects(s3, f"{prefix}/source/images/")
+    current_masks = list_objects(s3, f"{prefix}/source/masks/")
+    if (source_inventory(current_images) != source_inventory(images) or
+            source_inventory(current_masks) != source_inventory(masks)):
+        raise RuntimeError("dataset source roster changed during reconciliation")
+
+
 def build_sample_manifests(samples):
     return core_build_sample_manifests(samples)
 
 
-def build_samples_metadata(samples, extra_metadata=None):
-    try:
-        return core_build_samples_metadata(samples, extra_metadata=extra_metadata)
-    except ValueError as e:
-        log.warning("Ignoring preserved metadata during reconcile: %s", e)
-        return core_build_samples_metadata(samples)
+def build_samples_metadata(samples, extra_metadata=None, *,
+                           privacy_unit_col, label_col=None):
+    return core_build_samples_metadata(
+        samples, extra_metadata=extra_metadata,
+        privacy_unit_col=privacy_unit_col, label_col=label_col,
+    )
 
 
 def read_existing_samples_metadata(s3, prefix):
+    key = f"{prefix}/metadata/samples.parquet"
+    if not object_exists(s3, key):
+        raise ValueError("samples metadata is missing")
     try:
-        response = s3.get_object(Bucket=BUCKET, Key=f"{prefix}/metadata/samples.parquet")
+        response = s3.get_object(Bucket=BUCKET, Key=key)
         body = response["Body"]
         try:
             data = body.read()
         finally:
             body.close()
-        if not data:
-            return None
+    except Exception as exc:
+        raise ValueError("samples metadata could not be read") from exc
+    if not data:
+        raise ValueError("samples metadata is empty")
+    try:
         return pq.read_table(pa.BufferReader(data))
-    except Exception:
-        return None
+    except Exception as exc:
+        raise ValueError("samples metadata is corrupt") from exc
 
 
-def generate_manifest(dataset_id, prefix, modality, has_masks=False):
+def generate_manifest(dataset_id, prefix, modality, has_masks=False, *,
+                      privacy_unit_col, label_col=None,
+                      existing_manifest=None):
     return core_generate_manifest(
-        dataset_id, BUCKET, prefix, modality=modality, has_masks=has_masks
+        dataset_id, BUCKET, prefix, modality=modality, has_masks=has_masks,
+        privacy_unit_col=privacy_unit_col, label_col=label_col,
+        existing_manifest=existing_manifest,
     )
+
+
+def read_existing_manifest(s3, prefix):
+    key = f"{prefix}/manifest.yaml"
+    if not object_exists(s3, key):
+        raise ValueError("dataset manifest is missing; publish with dsimaging-admin first")
+    try:
+        response = s3.get_object(Bucket=BUCKET, Key=key)
+        body = response["Body"]
+        try:
+            manifest = yaml.safe_load(body.read())
+        finally:
+            body.close()
+    except Exception as exc:
+        raise ValueError("dataset manifest is corrupt") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("dataset manifest must be a mapping")
+    return manifest
+
+
+def snapshot_dataset_artifacts(s3, prefix):
+    snapshot = {}
+    for suffix in MANAGED_ARTIFACTS:
+        key = f"{prefix}/{suffix}"
+        if not object_exists(s3, key):
+            continue
+        response = s3.get_object(Bucket=BUCKET, Key=key)
+        body = response["Body"]
+        try:
+            snapshot[suffix] = body.read()
+        finally:
+            body.close()
+    return snapshot
+
+
+def restore_dataset_artifacts(s3, prefix, snapshot):
+    for suffix in MANAGED_ARTIFACTS:
+        key = f"{prefix}/{suffix}"
+        if suffix not in snapshot and object_exists(s3, key):
+            if delete_current_keys(s3, [key]) != 1:
+                raise RuntimeError("new managed artifact could not be removed")
+    for suffix in MANAGED_ARTIFACTS:
+        if suffix == "manifest.yaml" or suffix not in snapshot:
+            continue
+        s3.put_object(Bucket=BUCKET, Key=f"{prefix}/{suffix}", Body=snapshot[suffix])
+    if "manifest.yaml" in snapshot:
+        s3.put_object(
+            Bucket=BUCKET, Key=f"{prefix}/manifest.yaml",
+            Body=snapshot["manifest.yaml"], ContentType="application/yaml",
+        )
 
 
 def existing_modality(s3, prefix, fallback):
@@ -528,16 +744,6 @@ def write_yaml(tmpdir, filename, payload):
 
 def utc_now():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-def snapshot(mapping):
-    with state_lock:
-        return dict(mapping)
-
-
-def sorted_snapshot(values):
-    with state_lock:
-        return sorted(values)
 
 
 def main():
