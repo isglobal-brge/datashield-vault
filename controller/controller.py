@@ -32,6 +32,7 @@ from dsimaging_admin.manifest import (
     metadata_contract_from_manifest,
     scan_s3_images as core_scan_s3_images,
     scan_s3_masks as core_scan_s3_masks,
+    validate_manifest_scope,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -44,12 +45,12 @@ S3_ENDPOINT = os.environ.get("DSIMAGING_S3_ENDPOINT") or os.environ.get(
 S3_ACCESS_KEY = (
     os.environ.get("DSIMAGING_ACCESS_KEY")
     or os.environ.get("MINIO_ROOT_USER")
-    or ("" if SQS_QUEUE_URL else "minioadmin")
+    or ""
 )
 S3_SECRET_KEY = (
     os.environ.get("DSIMAGING_SECRET_KEY")
     or os.environ.get("MINIO_ROOT_PASSWORD")
-    or ("" if SQS_QUEUE_URL else "minioadmin123")
+    or ""
 )
 AWS_REGION = os.environ.get("DSIMAGING_AWS_REGION") or os.environ.get(
     "AWS_REGION", "us-east-1"
@@ -145,8 +146,8 @@ def handle_s3_event_payload(events):
         dataset_id = extract_dataset_id_from_source_key(item["key"])
         if dataset_id:
             log.info(
-                "Event: %s on %s (dataset: %s)",
-                item["event_name"], item["key"], dataset_id,
+                "Source event received for dataset %s (%s)",
+                dataset_id, item["event_name"],
             )
             mark_dirty(dataset_id)
             count += 1
@@ -164,8 +165,6 @@ def record_success(dataset_id, n_samples, n_masks=0):
     with state_lock:
         last_reconcile[dataset_id] = {
             "at": utc_now(),
-            "samples": n_samples,
-            "masks": n_masks,
         }
         last_errors.pop(dataset_id, None)
 
@@ -175,7 +174,6 @@ def record_failure(dataset_id, error):
         dirty_datasets.add(dataset_id)
         last_errors[dataset_id] = {
             "at": utc_now(),
-            "error": str(error),
         }
 
 
@@ -197,7 +195,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.write_error(409, "busy")
             except Exception as e:
                 record_failure(dataset_id, e)
-                log.exception("Manual reconciliation failed")
+                log.error("Manual reconciliation failed for dataset %s", dataset_id)
                 self.write_error(500, "reconciliation failed")
             return
 
@@ -218,7 +216,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             handle_s3_event_payload(body)
         except Exception:
-            log.exception("Webhook event could not be parsed")
+            log.error("Webhook event could not be parsed")
             self.write_error(400, "invalid request")
             return
 
@@ -235,7 +233,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self.write_json({"datasets": list_datasets()})
             except Exception:
-                log.exception("Dataset inventory could not be listed")
+                log.error("Dataset inventory could not be listed")
                 self.write_error(500, "inventory unavailable")
             return
 
@@ -326,16 +324,13 @@ def reconcile_loop():
             try:
                 n_samples, n_masks = reconcile_dataset(dataset_id)
                 record_success(dataset_id, n_samples, n_masks)
-                log.info(
-                    "Reconciled dataset %s (%s samples, %s masks)",
-                    dataset_id, n_samples, n_masks,
-                )
+                log.info("Reconciled dataset %s", dataset_id)
             except PublishInProgress:
                 mark_dirty(dataset_id)
                 log.info("Reconcile deferred for dataset %s: publish in progress", dataset_id)
             except Exception as e:
                 record_failure(dataset_id, e)
-                log.exception("Reconcile failed for dataset %s: %s", dataset_id, e)
+                log.error("Reconcile failed for dataset %s", dataset_id)
         time.sleep(RECONCILE_INTERVAL_SECONDS)
 
 
@@ -347,8 +342,8 @@ def sqs_loop():
     while True:
         try:
             process_sqs_messages(sqs, SQS_QUEUE_URL)
-        except Exception as e:
-            log.exception("SQS worker failed: %s", e)
+        except Exception:
+            log.error("SQS worker failed")
             time.sleep(5)
 
 
@@ -374,6 +369,8 @@ def process_sqs_messages(sqs, queue_url, wait_time_seconds=20):
 
 
 def reconcile_dataset(dataset_id):
+    if not isinstance(dataset_id, str) or not DATASET_ID_RE.fullmatch(dataset_id):
+        raise ValueError("invalid dataset id")
     s3 = get_s3()
     prefix = f"datasets/{dataset_id}"
     publish_lock = acquire_publish_lock(s3, prefix)
@@ -681,6 +678,7 @@ def read_existing_manifest(s3, prefix):
         raise ValueError("dataset manifest is corrupt") from exc
     if not isinstance(manifest, dict):
         raise ValueError("dataset manifest must be a mapping")
+    validate_manifest_scope(manifest, BUCKET, prefix)
     return manifest
 
 

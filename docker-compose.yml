@@ -1,13 +1,13 @@
 services:
   minio:
-    image: minio/minio:latest
+    image: ${DSIMAGING_STORE_MINIO_IMAGE:-minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e}
     command: server /data --console-address ":9001"
     ports:
-      - "${MINIO_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+      - "127.0.0.1:${MINIO_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
       # Webhook notification for controller
       MINIO_NOTIFY_WEBHOOK_ENABLE_DSIMAGING: "on"
       MINIO_NOTIFY_WEBHOOK_ENDPOINT_DSIMAGING: "http://controller:8080/webhook/minio"
@@ -21,15 +21,13 @@ services:
     restart: unless-stopped
 
   controller:
-    image: ${DSIMAGING_STORE_CONTROLLER_IMAGE:-dsimaging-store-controller:local}
-    build:
-      context: ./controller
+    image: ${DSIMAGING_STORE_CONTROLLER_IMAGE:-davidsarratgonzalez/dsimaging-store:0.3.5@sha256:0766d57e3ae3978ac98e77d33d99d2c9d151c1cd3553580e85a18b52485f85cb}
     ports:
       - "127.0.0.1:${CONTROLLER_PORT:-8080}:8080"
     environment:
       MINIO_ENDPOINT: http://minio:9000
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
       BUCKET_NAME: ${BUCKET_NAME:-imaging-data}
       RECONCILE_INTERVAL_SECONDS: ${RECONCILE_INTERVAL_SECONDS:-10}
       DSIMAGING_CONTROLLER_TOKEN: ${DSIMAGING_CONTROLLER_TOKEN:-}

@@ -106,15 +106,16 @@ class ControllerHttpTests(unittest.TestCase):
         controller.OPERATOR_TOKEN = "operator-token"
         with patch.object(
                 controller, "reconcile_dataset",
-                side_effect=RuntimeError("private bucket/path detail")), \
-                patch.object(controller.log, "exception"):
-            status, payload = self.request(
-                "POST", "/reconcile/study", token="operator-token")
+                side_effect=RuntimeError("private bucket/path detail")):
+            with self.assertLogs(controller.log, level="ERROR") as captured:
+                status, payload = self.request(
+                    "POST", "/reconcile/study", token="operator-token")
 
         self.assertEqual(status, 500)
         self.assertEqual(payload, {"error": "reconciliation failed"})
         self.assertNotIn("private", json.dumps(payload))
         self.assertNotIn("study", json.dumps(payload))
+        self.assertNotIn("private bucket/path detail", "\n".join(captured.output))
 
     def test_webhook_body_is_bounded_and_response_is_generic(self):
         controller.MAX_WEBHOOK_BODY_BYTES = 8

@@ -11,21 +11,36 @@ are written by dsHPC into its artifact/publish directories, not into this store.
 Use `dsimaging-admin` for lifecycle management:
 
 ```bash
-dsimaging-admin --backend minio store up
-dsimaging-admin --backend minio store init
-dsimaging-admin --backend minio store doctor
+dsimaging-admin --backend minio store init ./study-store
+dsimaging-admin store up ./study-store
+dsimaging-admin store doctor ./study-store
 ```
 
-`store up` runs this repository's `docker-compose.yml`. `store init` creates the
-bucket, enables versioning and configures MinIO bucket events for the
-controller webhook. There is no separate init container.
+`store init` writes a Compose project with versioned controller, MinIO and MinIO
+client images pinned by multi-architecture manifest digest, unique credentials
+in a mode-`0600` `.env`, and a one-shot init service.
+`store up` starts MinIO and the controller, then the init service creates the
+bucket, enables versioning and configures MinIO bucket events. No shared MinIO
+credential is built in.
 
-The repository can still be run directly:
+For controller development, opt into a build from a checked-out source tree:
 
 ```bash
-docker compose up -d
-dsimaging-admin --backend minio store init
+dsimaging-admin --backend minio store init ./study-store \
+  --store-source /path/to/dsimaging-store
 ```
+
+The checked-in Compose file can also be used directly after creating explicit
+credentials, but bucket/event initialization is still best performed through
+the generated project above:
+
+```bash
+cp .env.example .env
+# Replace both credential placeholders with unique random values.
+docker compose up -d
+```
+
+The local API, console and controller ports bind to `127.0.0.1` by default.
 
 ## AWS S3
 
@@ -111,8 +126,8 @@ controller only removes the lock instance it acquired itself.
 
 | Variable | Default | Description |
 |---|---|---|
-| `MINIO_ROOT_USER` | `minioadmin` | Local MinIO access key |
-| `MINIO_ROOT_PASSWORD` | `minioadmin123` | Local MinIO secret key |
+| `MINIO_ROOT_USER` | required | Local MinIO access key |
+| `MINIO_ROOT_PASSWORD` | required | Local MinIO secret key |
 | `MINIO_PORT` | `9000` | MinIO API port |
 | `MINIO_CONSOLE_PORT` | `9001` | MinIO console port |
 | `CONTROLLER_PORT` | `8080` | Controller port |

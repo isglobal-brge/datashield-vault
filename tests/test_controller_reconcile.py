@@ -114,6 +114,20 @@ class FakeS3:
 
 
 class ReconcileTests(unittest.TestCase):
+    def test_success_telemetry_does_not_retain_exact_collection_counts(self):
+        controller.last_reconcile.clear()
+
+        controller.record_success("study_ct_v1", 6, 2)
+
+        self.assertEqual(
+            set(controller.last_reconcile["study_ct_v1"]), {"at"})
+
+    def test_reconcile_rejects_invalid_dataset_id_before_storage_access(self):
+        with patch.object(controller, "get_s3") as get_s3:
+            with self.assertRaisesRegex(ValueError, "invalid dataset id"):
+                controller.reconcile_dataset("../other")
+        get_s3.assert_not_called()
+
     def setUp(self):
         self.bucket = "imaging-data"
         self.old_bucket = controller.BUCKET
@@ -153,6 +167,24 @@ class ReconcileTests(unittest.TestCase):
         controller.get_s3 = lambda: s3
 
         with self.assertRaisesRegex(ValueError, "manifest is corrupt"):
+            controller.reconcile_dataset("study_ct_v1")
+
+        self.assertEqual(s3.objects, before)
+
+    def test_reconcile_rejects_manifest_pointing_to_another_collection(self):
+        prefix = "datasets/study_ct_v1"
+        objects = self._published_objects(prefix, [("case001", "patient-a")])
+        manifest = yaml.safe_load(objects[f"{prefix}/manifest.yaml"])
+        manifest["assets"]["images"]["uri"] = (
+            "s3://imaging-data/datasets/other/source/images/")
+        objects[f"{prefix}/manifest.yaml"] = yaml.safe_dump(
+            manifest, sort_keys=False).encode("utf-8")
+        objects[f"{prefix}/source/images/case001.nii.gz"] = b"image"
+        before = dict(objects)
+        s3 = FakeS3(objects)
+        controller.get_s3 = lambda: s3
+
+        with self.assertRaisesRegex(ValueError, "canonical collection root"):
             controller.reconcile_dataset("study_ct_v1")
 
         self.assertEqual(s3.objects, before)

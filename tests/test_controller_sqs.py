@@ -46,12 +46,14 @@ class SqsTests(unittest.TestCase):
             }]
         }
         sqs = FakeSQS(json.dumps(event))
-        processed = controller.process_sqs_messages(
-            sqs, "https://sqs.example/dsimaging", wait_time_seconds=0)
+        with self.assertLogs(controller.log, level="INFO") as captured:
+            processed = controller.process_sqs_messages(
+                sqs, "https://sqs.example/dsimaging", wait_time_seconds=0)
 
         self.assertEqual(processed, 1)
         self.assertEqual(sqs.deleted, [("https://sqs.example/dsimaging", "receipt-1")])
         self.assertIn("lung_ct", controller.dirty_datasets)
+        self.assertNotIn("case001", "\n".join(captured.output))
 
     def test_sns_wrapped_s3_event_is_supported(self):
         event = {
