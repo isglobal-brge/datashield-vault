@@ -52,6 +52,19 @@ class ReleaseAssetTests(unittest.TestCase):
         )
         self.assertIn("USER controller:controller", dockerfile)
 
+    def test_example_env_keeps_digest_pinned_controller_default(self):
+        env_lines = (ROOT / ".env.example").read_text(
+            encoding="utf-8").splitlines()
+        active = [
+            line.strip() for line in env_lines
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+
+        self.assertFalse(any(
+            line.startswith("DSIMAGING_STORE_CONTROLLER_IMAGE=")
+            for line in active
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()

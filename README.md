@@ -42,7 +42,8 @@ the generated project above:
 
 ```bash
 cp .env.example .env
-# Replace both credential placeholders with unique random values.
+# Set unique MinIO credentials and a distinct long webhook token.
+# Set an operator token too when using inventory or manual reconcile endpoints.
 docker compose up -d
 ```
 

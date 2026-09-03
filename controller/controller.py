@@ -541,17 +541,23 @@ def list_objects(s3, prefix, *, include_version_ids=False):
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
         for obj in page.get("Contents", []):
-            version_id = None
             if include_version_ids:
-                version_id = s3.head_object(
-                    Bucket=BUCKET, Key=obj["Key"]
-                ).get("VersionId")
+                head = s3.head_object(Bucket=BUCKET, Key=obj["Key"])
+                objects.append({
+                    "key": obj["Key"],
+                    "size": int(head.get("ContentLength", 0)),
+                    "last_modified": head.get("LastModified").isoformat()
+                    if head.get("LastModified") else None,
+                    "etag": head.get("ETag", "").strip('"') or None,
+                    "version_id": head.get("VersionId"),
+                })
+                continue
             objects.append({
                 "key": obj["Key"],
                 "size": int(obj["Size"]),
                 "last_modified": obj["LastModified"].isoformat(),
                 "etag": obj.get("ETag", "").strip('"') or None,
-                "version_id": version_id,
+                "version_id": None,
             })
     return objects
 

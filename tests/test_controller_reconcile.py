@@ -60,6 +60,7 @@ class FakeS3:
         self.on_upload = None
         self.fail_upload_suffix = None
         self.upload_history = []
+        self.get_requests = []
 
     def get_paginator(self, name):
         if name != "list_objects_v2":
@@ -77,9 +78,13 @@ class FakeS3:
             "VersionId": f"version-{digest}",
         }
 
-    def get_object(self, Bucket, Key):
+    def get_object(self, Bucket, Key, VersionId=None):
         if Key not in self.objects:
             raise KeyError(Key)
+        expected_version = f"version-{hashlib.md5(self.objects[Key]).hexdigest()}"
+        if VersionId is not None and VersionId != expected_version:
+            raise KeyError((Key, VersionId))
+        self.get_requests.append((Key, VersionId))
         return {
             "Body": FakeBody(self.objects[Key]),
             "ETag": f'"{hashlib.md5(self.objects[Key]).hexdigest()}"',
@@ -332,6 +337,7 @@ class ReconcileTests(unittest.TestCase):
         ))
         expected = f"version-{hashlib.md5(b'image').hexdigest()}"
         self.assertEqual(index["version_id"].to_pylist(), [expected])
+        self.assertIn((image_key, expected), s3.get_requests)
 
     def test_reconcile_preserves_contract_and_repeated_patient_per_dataset(self):
         prefix_a = "datasets/study_a"
