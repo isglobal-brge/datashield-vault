@@ -141,11 +141,21 @@ class FakeS3:
 
 
 class ReconcileTests(unittest.TestCase):
+    def test_dataset_id_contract_matches_admin(self):
+        self.assertTrue(controller.is_valid_dataset_id("study_ct-v1.2"))
+        self.assertTrue(controller.is_valid_dataset_id("a" * 128))
+        for dataset_id in (
+                "", "Study", "study..v1", "a" * 129, None, b"study"):
+            with self.subTest(dataset_id=repr(dataset_id)[:24]):
+                self.assertFalse(controller.is_valid_dataset_id(dataset_id))
+
     def test_startup_recovery_enqueues_only_canonical_dirty_markers(self):
         s3 = FakeS3({
             f"{controller.DIRTY_PREFIX}study_a/{'a' * 32}": b"marker",
             f"{controller.DIRTY_PREFIX}study_b/{'b' * 32}": b"marker",
             f"{controller.DIRTY_PREFIX}Study_C/{'c' * 32}": b"invalid-id",
+            f"{controller.DIRTY_PREFIX}study..d/{'d' * 32}": b"invalid-dots",
+            f"{controller.DIRTY_PREFIX}{'e' * 129}/{'e' * 32}": b"too-long",
             f"{controller.DIRTY_PREFIX}study_d/not-a-marker": b"invalid-marker",
             "datasets/study_a/manifest.yaml": b"manifest",
             "datasets/unmarked/source/images/case001.nii.gz": b"image",
@@ -183,6 +193,8 @@ class ReconcileTests(unittest.TestCase):
             "datasets/study_a/manifest.yaml": b"manifest",
             "datasets/study_b/source/images/case001.nii.gz": b"image",
             "datasets/Study_C/manifest.yaml": b"invalid-id",
+            "datasets/study..d/manifest.yaml": b"invalid-dots",
+            f"datasets/{'e' * 129}/manifest.yaml": b"too-long",
         })
         with patch.object(controller, "get_s3", return_value=s3):
             migrated = controller.migrate_legacy_pending_datasets()
@@ -299,10 +311,12 @@ class ReconcileTests(unittest.TestCase):
             set(controller.last_reconcile["study_ct_v1"]), {"at"})
 
     def test_reconcile_rejects_invalid_dataset_id_before_storage_access(self):
-        with patch.object(controller, "get_s3") as get_s3:
-            with self.assertRaisesRegex(ValueError, "invalid dataset id"):
-                controller.reconcile_dataset("../other")
-        get_s3.assert_not_called()
+        for dataset_id in ("../other", "study..v1", "a" * 129):
+            with self.subTest(dataset_id=dataset_id[:20]), \
+                    patch.object(controller, "get_s3") as get_s3:
+                with self.assertRaisesRegex(ValueError, "invalid dataset id"):
+                    controller.reconcile_dataset(dataset_id)
+                get_s3.assert_not_called()
 
     def test_reconcile_loop_does_not_requeue_fully_deleted_dataset(self):
         dataset_id = "study_ct_v1"
@@ -1117,6 +1131,8 @@ class ReconcileTests(unittest.TestCase):
         objects = {
             "datasets/study_a/manifest.yaml": b"valid",
             "datasets/Study_B/manifest.yaml": b"noncanonical",
+            "datasets/study..c/manifest.yaml": b"invalid-dots",
+            f"datasets/{'d' * 129}/manifest.yaml": b"too-long",
         }
         s3 = FakeS3(objects)
         controller.get_s3 = lambda: s3

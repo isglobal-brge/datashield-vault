@@ -101,17 +101,23 @@ class SqsTests(unittest.TestCase):
         self.assertIn("lung_ct", controller.dirty_datasets)
 
     def test_event_with_invalid_dataset_id_is_ignored(self):
-        event = {
-            "Records": [{
-                "eventName": "ObjectCreated:Put",
-                "s3": {"object": {
-                    "key": "datasets/../source/images/case001.nii.gz",
-                }},
-            }]
-        }
+        invalid_ids = ["..", "study..v1", "a" * 129]
+        for dataset_id in invalid_ids:
+            with self.subTest(dataset_id=dataset_id[:20]):
+                event = {
+                    "Records": [{
+                        "eventName": "ObjectCreated:Put",
+                        "s3": {"object": {
+                            "key": (
+                                f"datasets/{dataset_id}/source/images/"
+                                "case001.nii.gz"
+                            ),
+                        }},
+                    }]
+                }
 
-        self.assertEqual(controller.handle_s3_event_payload(event), 0)
-        self.assertEqual(controller.dirty_datasets, set())
+                self.assertEqual(controller.handle_s3_event_payload(event), 0)
+                self.assertEqual(controller.dirty_datasets, set())
 
     def test_malformed_record_does_not_discard_valid_record(self):
         event = {

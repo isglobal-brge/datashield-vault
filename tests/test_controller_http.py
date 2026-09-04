@@ -124,6 +124,18 @@ class ControllerHttpTests(unittest.TestCase):
         self.assertEqual(get_payload, {"error": "not found"})
         self.assertEqual(post_payload, {"error": "not found"})
 
+    def test_manual_reconcile_rejects_noncanonical_dataset_ids(self):
+        controller.OPERATOR_TOKEN = "operator-token"
+        for dataset_id in ("study..v1", "a" * 129):
+            with self.subTest(dataset_id=dataset_id[:20]), patch.object(
+                    controller, "persist_dirty_datasets") as persist:
+                status, payload = self.request(
+                    "POST", f"/reconcile/{dataset_id}", token="operator-token")
+
+                self.assertEqual(status, 400)
+                self.assertEqual(payload, {"error": "invalid request"})
+                persist.assert_not_called()
+
     def test_inventory_requires_bearer_token(self):
         controller.OPERATOR_TOKEN = "operator-token"
         inventory = [{

@@ -32,6 +32,7 @@ from dsimaging_admin.manifest import (
     metadata_contract_from_manifest,
     scan_s3_images as core_scan_s3_images,
     scan_s3_masks as core_scan_s3_masks,
+    validate_dataset_id as core_validate_dataset_id,
     validate_manifest_scope,
 )
 
@@ -75,7 +76,6 @@ MANAGED_ARTIFACTS = (
     "metadata/sample_manifests.parquet",
     "metadata/samples.parquet",
 )
-DATASET_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 DIRTY_MARKER_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 state_lock = threading.Lock()
@@ -104,6 +104,15 @@ class InvalidSourceContent(InvalidDatasetContent):
     """Raised when source images or masks fail deterministic validation."""
 
 
+def is_valid_dataset_id(dataset_id):
+    """Return whether a dataset ID satisfies the shared admin/store contract."""
+    try:
+        core_validate_dataset_id(dataset_id)
+    except (TypeError, UnicodeError, ValueError):
+        return False
+    return True
+
+
 def get_s3():
     import boto3
     kwargs = {"region_name": AWS_REGION}
@@ -128,7 +137,7 @@ def extract_dataset_id_from_source_key(key):
         and parts[0] == "datasets"
         and parts[2] == "source"
         and parts[3] in {"images", "masks"}
-        and DATASET_ID_RE.fullmatch(parts[1])
+        and is_valid_dataset_id(parts[1])
     ):
         return parts[1]
     return None
@@ -277,7 +286,7 @@ def migrate_legacy_pending_datasets():
                 continue
             parts = prefix.split("/")
             if (len(parts) == 3 and parts[0] == "datasets" and not parts[2]
-                    and DATASET_ID_RE.fullmatch(parts[1])):
+                    and is_valid_dataset_id(parts[1])):
                 dataset_ids.add(parts[1])
 
     for dataset_id in sorted(dataset_ids):
@@ -334,7 +343,7 @@ def dataset_id_from_dirty_marker_key(key):
     if not isinstance(key, str) or not key.startswith(DIRTY_PREFIX):
         return None
     parts = key[len(DIRTY_PREFIX):].split("/")
-    if (len(parts) != 2 or not DATASET_ID_RE.fullmatch(parts[0]) or
+    if (len(parts) != 2 or not is_valid_dataset_id(parts[0]) or
             not DIRTY_MARKER_ID_RE.fullmatch(parts[1])):
         return None
     return parts[0]
@@ -381,7 +390,7 @@ class Handler(BaseHTTPRequestHandler):
             if not self.require_operator():
                 return
             dataset_id = self.path.split("/reconcile/", 1)[1]
-            if not DATASET_ID_RE.fullmatch(dataset_id or ""):
+            if not is_valid_dataset_id(dataset_id):
                 self.write_error(400, "invalid request")
                 return
             try:
@@ -516,7 +525,7 @@ def list_datasets():
     for page in paginator.paginate(Bucket=BUCKET, Prefix="datasets/", Delimiter="/"):
         for cp in page.get("CommonPrefixes", []):
             dataset_id = cp["Prefix"].strip("/").split("/")[-1]
-            if not DATASET_ID_RE.fullmatch(dataset_id):
+            if not is_valid_dataset_id(dataset_id):
                 continue
             if not prefix_has_current_objects(s3, f"datasets/{dataset_id}/"):
                 continue
@@ -697,7 +706,7 @@ def process_sqs_messages(sqs, queue_url, wait_time_seconds=20):
 
 
 def reconcile_dataset(dataset_id):
-    if not isinstance(dataset_id, str) or not DATASET_ID_RE.fullmatch(dataset_id):
+    if not is_valid_dataset_id(dataset_id):
         raise ValueError("invalid dataset id")
     s3 = get_s3()
     prefix = f"datasets/{dataset_id}"
