@@ -22,7 +22,7 @@ services:
     restart: unless-stopped
 
   controller:
-    image: ${DSIMAGING_STORE_CONTROLLER_IMAGE:-davidsarrat/dsimaging-store:0.3.13@sha256:1104d660bc43b3886ce9d094070424a427936da39723b8ed47c0d7d12843c64f}
+    image: ${DSIMAGING_STORE_CONTROLLER_IMAGE:-davidsarrat/dsimaging-store:0.3.14@sha256:a7028f0875a37bd7dfd0ede906cb8120bcf31f7ab729b166cf0e375f73b38d91}
     ports:
       - "127.0.0.1:${CONTROLLER_PORT:-8080}:8080"
     environment:
