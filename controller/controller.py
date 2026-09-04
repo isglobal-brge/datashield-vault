@@ -89,6 +89,10 @@ class LockOwnershipLost(Exception):
     """Raised when this reconciliation no longer owns its dataset lock."""
 
 
+class InvalidSourceContent(ValueError):
+    """Raised when source images or masks fail deterministic validation."""
+
+
 def get_s3():
     import boto3
     kwargs = {"region_name": AWS_REGION}
@@ -170,9 +174,10 @@ def record_success(dataset_id, n_samples, n_masks=0):
         last_errors.pop(dataset_id, None)
 
 
-def record_failure(dataset_id, error):
+def record_failure(dataset_id, error, retry=True):
     with state_lock:
-        dirty_datasets.add(dataset_id)
+        if retry:
+            dirty_datasets.add(dataset_id)
         last_errors[dataset_id] = {
             "at": utc_now(),
         }
@@ -194,6 +199,10 @@ class Handler(BaseHTTPRequestHandler):
             except PublishInProgress:
                 mark_dirty(dataset_id)
                 self.write_error(409, "busy")
+            except InvalidSourceContent as e:
+                record_failure(dataset_id, e, retry=False)
+                log.error("Manual reconciliation failed for dataset %s", dataset_id)
+                self.write_error(500, "reconciliation failed")
             except Exception as e:
                 record_failure(dataset_id, e)
                 log.error("Manual reconciliation failed for dataset %s", dataset_id)
@@ -351,6 +360,9 @@ def reconcile_loop():
             except PublishInProgress:
                 mark_dirty(dataset_id)
                 log.info("Reconcile deferred for dataset %s: publish in progress", dataset_id)
+            except InvalidSourceContent as e:
+                record_failure(dataset_id, e, retry=False)
+                log.error("Reconcile failed for dataset %s", dataset_id)
             except Exception as e:
                 record_failure(dataset_id, e)
                 log.error("Reconcile failed for dataset %s", dataset_id)
@@ -410,11 +422,14 @@ def reconcile_dataset(dataset_id):
             s3, f"{prefix}/source/images/", include_version_ids=True)
         mask_objects = list_objects(
             s3, f"{prefix}/source/masks/", include_version_ids=True)
-        samples = scan_s3_images(s3, prefix, objects)
-        masks = scan_s3_masks(
-            s3, prefix, mask_objects,
-            sample_ids=[sample["sample_id"] for sample in samples],
-        )
+        try:
+            samples = scan_s3_images(s3, prefix, objects)
+            masks = scan_s3_masks(
+                s3, prefix, mask_objects,
+                sample_ids=[sample["sample_id"] for sample in samples],
+            )
+        except ValueError as exc:
+            raise InvalidSourceContent(str(exc)) from exc
         if not samples:
             current_keys = {
                 obj["key"] for obj in list_objects(s3, f"{prefix}/")

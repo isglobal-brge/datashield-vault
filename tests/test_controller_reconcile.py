@@ -162,7 +162,7 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(failures, {})
         self.assertEqual(s3.objects, {})
 
-    def test_reconcile_loop_requeues_when_any_other_object_remains(self):
+    def test_reconcile_loop_requeues_missing_manifest(self):
         dataset_id = "study_ct_v1"
         prefix = f"datasets/{dataset_id}"
         leftover_key = f"{prefix}/unmanaged-object"
@@ -189,10 +189,93 @@ class ReconcileTests(unittest.TestCase):
         failure = record_failure.call_args.args[1]
         self.assertIsInstance(failure, ValueError)
         self.assertIn("manifest is missing", str(failure))
+        self.assertEqual(record_failure.call_args.kwargs, {})
         self.assertEqual(dirty, {dataset_id})
         self.assertEqual(successes, {})
         self.assertIn(dataset_id, failures)
         self.assertEqual(s3.objects, {leftover_key: b"leftover"})
+
+    def test_reconcile_loop_does_not_retry_invalid_source_and_releases_lock(self):
+        dataset_id = "study_ct_v1"
+        prefix = f"datasets/{dataset_id}"
+        objects = self._published_objects(
+            prefix, [("case001", "patient-a")])
+        objects.update({
+            f"{prefix}/source/images/site-a/case001.nii.gz": b"one",
+            f"{prefix}/source/images/site-b/case001.nii.gz": b"two",
+        })
+        s3 = FakeS3(objects)
+        controller.get_s3 = lambda: s3
+        dirty = {dataset_id}
+        failures = {}
+
+        with patch.multiple(
+                controller,
+                dirty_datasets=dirty,
+                last_reconcile={},
+                last_errors=failures,
+        ), patch.object(
+                controller, "record_failure", wraps=controller.record_failure,
+        ) as record_failure, patch.object(
+                controller.time, "sleep", side_effect=StopIteration,
+        ):
+            with self.assertLogs(controller.log, level="ERROR"):
+                with self.assertRaises(StopIteration):
+                    controller.reconcile_loop()
+
+        failure = record_failure.call_args.args[1]
+        self.assertIsInstance(failure, controller.InvalidSourceContent)
+        self.assertEqual(record_failure.call_args.kwargs, {"retry": False})
+        self.assertEqual(dirty, set())
+        self.assertIn(dataset_id, failures)
+        self.assertNotIn(f"{prefix}/{controller.PUBLISH_LOCK}", s3.objects)
+
+    def test_reconcile_loop_requeues_transient_failure(self):
+        dataset_id = "study_ct_v1"
+        dirty = {dataset_id}
+        failures = {}
+
+        with patch.multiple(
+                controller,
+                dirty_datasets=dirty,
+                last_reconcile={},
+                last_errors=failures,
+        ), patch.object(
+                controller, "reconcile_dataset",
+                side_effect=RuntimeError("temporary storage failure"),
+        ), patch.object(
+                controller.time, "sleep", side_effect=StopIteration,
+        ):
+            with self.assertLogs(controller.log, level="ERROR"):
+                with self.assertRaises(StopIteration):
+                    controller.reconcile_loop()
+
+        self.assertEqual(dirty, {dataset_id})
+        self.assertIn(dataset_id, failures)
+
+    def test_event_during_validation_failure_remains_dirty(self):
+        dataset_id = "study_ct_v1"
+        dirty = {dataset_id}
+
+        def fail_after_event(_dataset_id):
+            controller.mark_dirty(_dataset_id)
+            raise controller.InvalidSourceContent("invalid dataset content")
+
+        with patch.multiple(
+                controller,
+                dirty_datasets=dirty,
+                last_reconcile={},
+                last_errors={},
+        ), patch.object(
+                controller, "reconcile_dataset", side_effect=fail_after_event,
+        ), patch.object(
+                controller.time, "sleep", side_effect=StopIteration,
+        ):
+            with self.assertLogs(controller.log, level="ERROR"):
+                with self.assertRaises(StopIteration):
+                    controller.reconcile_loop()
+
+        self.assertEqual(dirty, {dataset_id})
 
     def test_deleted_prefix_rechecks_source_after_first_prefix_listing(self):
         dataset_id = "study_ct_v1"

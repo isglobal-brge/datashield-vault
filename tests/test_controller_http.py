@@ -119,6 +119,22 @@ class ControllerHttpTests(unittest.TestCase):
         self.assertNotIn("private", json.dumps(payload))
         self.assertNotIn("study", json.dumps(payload))
         self.assertNotIn("private bucket/path detail", "\n".join(captured.output))
+        self.assertIn("study", controller.dirty_datasets)
+
+    def test_source_validation_failure_is_recorded_without_background_retry(self):
+        controller.OPERATOR_TOKEN = "operator-token"
+        with patch.object(
+                controller, "reconcile_dataset",
+                side_effect=controller.InvalidSourceContent(
+                    "invalid dataset content")):
+            with self.assertLogs(controller.log, level="ERROR"):
+                status, payload = self.request(
+                    "POST", "/reconcile/study", token="operator-token")
+
+        self.assertEqual(status, 500)
+        self.assertEqual(payload, {"error": "reconciliation failed"})
+        self.assertNotIn("study", controller.dirty_datasets)
+        self.assertIn("study", controller.last_errors)
 
     def test_webhook_body_is_bounded_and_response_is_generic(self):
         controller.MAX_WEBHOOK_BODY_BYTES = 8

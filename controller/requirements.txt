@@ -13,4 +13,4 @@ requests==2.34.2
 s3transfer==0.19.2
 six==1.17.0
 urllib3==2.7.0
-dsimaging-admin @ https://github.com/isglobal-brge/dsimaging-admin/archive/5ba78c75dbc35a8e98e27e324b7d406d257d5c32.tar.gz
+dsimaging-admin @ https://github.com/isglobal-brge/dsimaging-admin/archive/8d9cd5d62d359a0a9ab0384c1ba2aa1c4770b8dd.tar.gz
