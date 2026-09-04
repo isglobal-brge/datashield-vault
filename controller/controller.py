@@ -57,11 +57,17 @@ AWS_REGION = os.environ.get("DSIMAGING_AWS_REGION") or os.environ.get(
 )
 BUCKET = os.environ.get("BUCKET_NAME", "imaging-data")
 RECONCILE_INTERVAL_SECONDS = int(os.environ.get("RECONCILE_INTERVAL_SECONDS", "10"))
+STARTUP_RECOVERY_MAX_BACKOFF_SECONDS = 30
+LOCK_OBSERVE_RETRIES = 3
+LOCK_OBSERVE_DELAY_SECONDS = 0.05
 OPERATOR_TOKEN = os.environ.get("DSIMAGING_CONTROLLER_TOKEN", "").strip()
 WEBHOOK_TOKEN = os.environ.get("DSIMAGING_WEBHOOK_TOKEN", "").strip()
 MAX_WEBHOOK_BODY_BYTES = int(os.environ.get(
     "DSIMAGING_MAX_WEBHOOK_BODY_BYTES", str(1024 * 1024)))
 PUBLISH_LOCK = ".publish-lock"
+DIRTY_PREFIX = "_controller/dirty/"
+DIRTY_MIGRATION_KEY = "_controller/migrations/durable-dirty-v1.complete"
+DIRTY_MIGRATION_MARKER_ID = "0" * 32
 MANAGED_ARTIFACTS = (
     "manifest.yaml",
     "indexes/content_hash_index.parquet",
@@ -70,6 +76,7 @@ MANAGED_ARTIFACTS = (
     "metadata/samples.parquet",
 )
 DATASET_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+DIRTY_MARKER_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 state_lock = threading.Lock()
 dirty_datasets = set()
@@ -89,7 +96,11 @@ class LockOwnershipLost(Exception):
     """Raised when this reconciliation no longer owns its dataset lock."""
 
 
-class InvalidSourceContent(ValueError):
+class InvalidDatasetContent(ValueError):
+    """Raised when published dataset content fails deterministic validation."""
+
+
+class InvalidSourceContent(InvalidDatasetContent):
     """Raised when source images or masks fail deterministic validation."""
 
 
@@ -128,15 +139,80 @@ def mark_dirty(dataset_id):
         dirty_datasets.add(dataset_id)
 
 
+def dirty_marker_key(dataset_id, marker_id):
+    return f"{DIRTY_PREFIX}{dataset_id}/{marker_id}"
+
+
+def require_bucket_versioning(s3):
+    try:
+        status = s3.get_bucket_versioning(Bucket=BUCKET).get("Status")
+    except Exception as exc:
+        raise RuntimeError("bucket versioning could not be verified") from exc
+    if status != "Enabled":
+        raise RuntimeError("bucket versioning must be enabled")
+
+
+def usable_version_id(value):
+    return isinstance(value, str) and value not in ("", "null")
+
+
+def require_object_version(s3, key):
+    version_id = s3.head_object(Bucket=BUCKET, Key=key).get("VersionId")
+    if not usable_version_id(version_id):
+        raise RuntimeError("object has no usable version ID")
+    return version_id
+
+
+def put_dirty_marker(s3, dataset_id, marker_id, *, mark_memory=True):
+    key = dirty_marker_key(dataset_id, marker_id)
+    response = s3.put_object(
+        Bucket=BUCKET,
+        Key=key,
+        Body=json.dumps({"event_id": marker_id}).encode("utf-8"),
+        ContentType="application/json",
+        IfNoneMatch="*",
+    )
+    version_id = response.get("VersionId")
+    if not usable_version_id(version_id):
+        raise RuntimeError("versioned dirty marker could not be established")
+    if mark_memory:
+        mark_dirty(dataset_id)
+    return {
+        "key": key,
+        "etag": response.get("ETag"),
+        "version_id": version_id,
+    }
+
+
+def persist_dirty_marker(s3, dataset_id, *, mark_memory=True):
+    """Persist work before an event delivery can be acknowledged."""
+    require_bucket_versioning(s3)
+    return put_dirty_marker(
+        s3, dataset_id, uuid.uuid4().hex, mark_memory=mark_memory)
+
+
 def iter_s3_event_records(events):
     """Yield normalized records from S3/MinIO event JSON."""
     if isinstance(events, (bytes, bytearray)):
         events = json.loads(events.decode())
     elif isinstance(events, str):
         events = json.loads(events)
-    for record in events.get("Records", []):
-        raw_key = record.get("s3", {}).get("object", {}).get("key", "")
-        if not raw_key:
+    if not isinstance(events, dict):
+        raise ValueError("event envelope must be a mapping")
+    records = events.get("Records", [])
+    if not isinstance(records, list):
+        raise ValueError("event Records must be a list")
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        s3_record = record.get("s3")
+        if not isinstance(s3_record, dict):
+            continue
+        object_record = s3_record.get("object")
+        if not isinstance(object_record, dict):
+            continue
+        raw_key = object_record.get("key")
+        if not isinstance(raw_key, str) or not raw_key:
             continue
         yield {
             "key": unquote_plus(raw_key),
@@ -144,19 +220,36 @@ def iter_s3_event_records(events):
         }
 
 
-def handle_s3_event_payload(events):
-    """Mark datasets dirty for source image/mask S3 events."""
-    count = 0
+def dataset_ids_from_s3_event_payload(events):
+    """Return canonical dataset IDs affected by an S3 event payload."""
+    dataset_ids = []
+    seen = set()
     for item in iter_s3_event_records(events):
         dataset_id = extract_dataset_id_from_source_key(item["key"])
-        if dataset_id:
+        if dataset_id and dataset_id not in seen:
             log.info(
                 "Source event received for dataset %s (%s)",
                 dataset_id, item["event_name"],
             )
-            mark_dirty(dataset_id)
-            count += 1
-    return count
+            seen.add(dataset_id)
+            dataset_ids.append(dataset_id)
+    return dataset_ids
+
+
+def persist_dirty_datasets(dataset_ids, *, mark_memory=True):
+    if not dataset_ids:
+        return 0
+    s3 = get_s3()
+    require_bucket_versioning(s3)
+    for dataset_id in dataset_ids:
+        put_dirty_marker(
+            s3, dataset_id, uuid.uuid4().hex, mark_memory=mark_memory)
+    return len(dataset_ids)
+
+
+def handle_s3_event_payload(events):
+    """Durably queue datasets affected by source image/mask S3 events."""
+    return persist_dirty_datasets(dataset_ids_from_s3_event_payload(events))
 
 
 def pop_dirty_batch():
@@ -164,6 +257,105 @@ def pop_dirty_batch():
         batch = sorted(dirty_datasets)
         dirty_datasets.clear()
     return batch
+
+
+def migrate_legacy_pending_datasets():
+    """Seed durable work once when upgrading from the in-memory queue."""
+    s3 = get_s3()
+    require_bucket_versioning(s3)
+    if object_exists(s3, DIRTY_MIGRATION_KEY):
+        require_object_version(s3, DIRTY_MIGRATION_KEY)
+        return 0
+
+    dataset_ids = set()
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(
+            Bucket=BUCKET, Prefix="datasets/", Delimiter="/"):
+        for item in page.get("CommonPrefixes", []):
+            prefix = item.get("Prefix")
+            if not isinstance(prefix, str):
+                continue
+            parts = prefix.split("/")
+            if (len(parts) == 3 and parts[0] == "datasets" and not parts[2]
+                    and DATASET_ID_RE.fullmatch(parts[1])):
+                dataset_ids.add(parts[1])
+
+    for dataset_id in sorted(dataset_ids):
+        key = dirty_marker_key(dataset_id, DIRTY_MIGRATION_MARKER_ID)
+        if object_exists(s3, key):
+            require_object_version(s3, key)
+            continue
+        try:
+            put_dirty_marker(
+                s3, dataset_id, DIRTY_MIGRATION_MARKER_ID,
+                mark_memory=False,
+            )
+        except Exception:
+            if not object_exists(s3, key):
+                raise
+            require_object_version(s3, key)
+
+    try:
+        response = s3.put_object(
+            Bucket=BUCKET,
+            Key=DIRTY_MIGRATION_KEY,
+            Body=json.dumps({"status": "complete"}).encode("utf-8"),
+            ContentType="application/json",
+            IfNoneMatch="*",
+        )
+    except Exception:
+        if not object_exists(s3, DIRTY_MIGRATION_KEY):
+            raise
+        require_object_version(s3, DIRTY_MIGRATION_KEY)
+    else:
+        if not usable_version_id(response.get("VersionId")):
+            raise RuntimeError("versioned migration marker could not be established")
+    return len(dataset_ids)
+
+
+def enqueue_persisted_dirty_datasets():
+    """Recover only event work durably acknowledged by this controller."""
+    s3 = get_s3()
+    require_bucket_versioning(s3)
+    dataset_ids = set()
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=DIRTY_PREFIX):
+        for item in page.get("Contents", []):
+            key = item.get("Key")
+            dataset_id = dataset_id_from_dirty_marker_key(key)
+            if dataset_id:
+                dataset_ids.add(dataset_id)
+    with state_lock:
+        dirty_datasets.update(dataset_ids)
+    return len(dataset_ids)
+
+
+def dataset_id_from_dirty_marker_key(key):
+    if not isinstance(key, str) or not key.startswith(DIRTY_PREFIX):
+        return None
+    parts = key[len(DIRTY_PREFIX):].split("/")
+    if (len(parts) != 2 or not DATASET_ID_RE.fullmatch(parts[0]) or
+            not DIRTY_MARKER_ID_RE.fullmatch(parts[1])):
+        return None
+    return parts[0]
+
+
+def recover_then_reconcile():
+    """Recover durable work with backoff, then enter the normal loop."""
+    backoff = 1
+    while True:
+        try:
+            migrated = migrate_legacy_pending_datasets()
+            enqueue_persisted_dirty_datasets()
+            if migrated:
+                log.info("Durable reconciliation queue migration completed")
+            log.info("Persisted reconciliation work queued")
+            break
+        except Exception:
+            log.error("Persisted reconciliation work could not be listed")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, STARTUP_RECOVERY_MAX_BACKOFF_SECONDS)
+    reconcile_loop()
 
 
 def record_success(dataset_id, n_samples, n_masks=0):
@@ -193,13 +385,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.write_error(400, "invalid request")
                 return
             try:
-                n_samples, n_masks = reconcile_dataset(dataset_id)
+                persist_dirty_datasets([dataset_id], mark_memory=False)
+                n_samples, n_masks = reconcile_pending_dataset(dataset_id)
                 record_success(dataset_id, n_samples, n_masks)
                 self.write_json({"status": "ok"})
             except PublishInProgress:
                 mark_dirty(dataset_id)
                 self.write_error(409, "busy")
-            except InvalidSourceContent as e:
+            except InvalidDatasetContent as e:
                 record_failure(dataset_id, e, retry=False)
                 log.error("Manual reconciliation failed for dataset %s", dataset_id)
                 self.write_error(500, "reconciliation failed")
@@ -226,10 +419,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         body = self.rfile.read(content_length)
         try:
-            handle_s3_event_payload(body)
-        except Exception:
+            dataset_ids = dataset_ids_from_s3_event_payload(body)
+        except (AttributeError, KeyError, RecursionError, TypeError, UnicodeError,
+                ValueError):
             log.error("Webhook event could not be parsed")
             self.write_error(400, "invalid request")
+            return
+        try:
+            persist_dirty_datasets(dataset_ids)
+        except Exception:
+            log.error("Webhook event could not be persisted")
+            self.write_error(503, "temporarily unavailable")
             return
 
         self.write_json({"status": "ok"})
@@ -336,8 +536,81 @@ def object_exists(s3, key):
     try:
         s3.head_object(Bucket=BUCKET, Key=key)
         return True
-    except Exception:
+    except Exception as exc:
+        if object_not_found(exc):
+            return False
+        raise
+
+
+def object_not_found(exc):
+    if isinstance(exc, KeyError):
+        return True
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
         return False
+    code = response.get("Error", {}).get("Code")
+    return str(code) in {"404", "NoSuchKey", "NotFound"}
+
+
+def dirty_marker_snapshot(s3, dataset_id):
+    """Snapshot current marker objects; later events use different UUID keys."""
+    markers = []
+    prefix = f"{DIRTY_PREFIX}{dataset_id}/"
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
+        for item in page.get("Contents", []):
+            key = item.get("Key")
+            if dataset_id_from_dirty_marker_key(key) != dataset_id:
+                continue
+            try:
+                response = s3.head_object(Bucket=BUCKET, Key=key)
+            except Exception as exc:
+                if object_not_found(exc):
+                    continue
+                raise
+            version_id = response.get("VersionId")
+            if not usable_version_id(version_id):
+                raise RuntimeError("dirty marker has no usable version ID")
+            markers.append({
+                "key": key,
+                "version_id": version_id,
+            })
+    return markers
+
+
+def clear_dirty_markers(s3, markers):
+    cleared = True
+    for marker in markers:
+        if not usable_version_id(marker.get("version_id")):
+            cleared = False
+            continue
+        kwargs = {
+            "Bucket": BUCKET,
+            "Key": marker["key"],
+            "VersionId": marker["version_id"],
+        }
+        try:
+            s3.delete_object(**kwargs)
+        except Exception as exc:
+            if not object_not_found(exc):
+                cleared = False
+    return cleared
+
+
+def reconcile_pending_dataset(dataset_id):
+    """Reconcile one queued dataset and consume only its observed marker."""
+    s3 = get_s3()
+    require_bucket_versioning(s3)
+    markers = dirty_marker_snapshot(s3, dataset_id)
+    try:
+        result = reconcile_dataset(dataset_id)
+    except InvalidDatasetContent:
+        if not clear_dirty_markers(s3, markers):
+            mark_dirty(dataset_id)
+        raise
+    if not clear_dirty_markers(s3, markers):
+        mark_dirty(dataset_id)
+    return result
 
 
 def prefix_has_current_objects(s3, prefix):
@@ -351,16 +624,20 @@ def prefix_has_current_objects(s3, prefix):
 
 def reconcile_loop():
     while True:
+        try:
+            enqueue_persisted_dirty_datasets()
+        except Exception:
+            log.error("Persisted reconciliation work could not be refreshed")
         batch = pop_dirty_batch()
         for dataset_id in batch:
             try:
-                n_samples, n_masks = reconcile_dataset(dataset_id)
+                n_samples, n_masks = reconcile_pending_dataset(dataset_id)
                 record_success(dataset_id, n_samples, n_masks)
                 log.info("Reconciled dataset %s", dataset_id)
             except PublishInProgress:
                 mark_dirty(dataset_id)
                 log.info("Reconcile deferred for dataset %s: publish in progress", dataset_id)
-            except InvalidSourceContent as e:
+            except InvalidDatasetContent as e:
                 record_failure(dataset_id, e, retry=False)
                 log.error("Reconcile failed for dataset %s", dataset_id)
             except Exception as e:
@@ -372,14 +649,20 @@ def reconcile_loop():
 def sqs_loop():
     if not SQS_QUEUE_URL:
         return
-    sqs = get_sqs()
     log.info("SQS worker enabled: %s", SQS_QUEUE_URL)
+    sqs = None
+    backoff = 1
     while True:
         try:
+            if sqs is None:
+                sqs = get_sqs()
             process_sqs_messages(sqs, SQS_QUEUE_URL)
+            backoff = 1
         except Exception:
+            sqs = None
             log.error("SQS worker failed")
-            time.sleep(5)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, STARTUP_RECOVERY_MAX_BACKOFF_SECONDS)
 
 
 def process_sqs_messages(sqs, queue_url, wait_time_seconds=20):
@@ -395,12 +678,16 @@ def process_sqs_messages(sqs, queue_url, wait_time_seconds=20):
             body = json.loads(message.get("Body", "{}"))
             if "Message" in body:
                 body = json.loads(body["Message"])
-            handle_s3_event_payload(body)
+            dataset_ids = dataset_ids_from_s3_event_payload(body)
         except (AttributeError, KeyError, RecursionError, TypeError, ValueError,
-                json.JSONDecodeError):
+                UnicodeError):
             # A malformed notification is not transient. Delete it so one
             # poison message cannot wedge the event consumer indefinitely.
             log.warning("Discarding malformed SQS notification")
+        else:
+            # Persistence is deliberately outside the malformed-message catch:
+            # an S3 failure is transient and the notification must not be ACKed.
+            persist_dirty_datasets(dataset_ids)
         sqs.delete_message(
             QueueUrl=queue_url,
             ReceiptHandle=message["ReceiptHandle"],
@@ -416,7 +703,6 @@ def reconcile_dataset(dataset_id):
     prefix = f"datasets/{dataset_id}"
     publish_lock = acquire_publish_lock(s3, prefix)
     release_lock = True
-    completed = False
     try:
         objects = list_objects(
             s3, f"{prefix}/source/images/", include_version_ids=True)
@@ -445,10 +731,9 @@ def reconcile_dataset(dataset_id):
                     raise RuntimeError(
                         "dataset changed during deleted-prefix reconciliation"
                     )
-                completed = True
                 return 0, 0
             manifest = read_existing_manifest(s3, prefix)
-            metadata_contract_from_manifest(manifest)
+            read_metadata_contract(manifest)
             read_existing_samples_metadata(s3, prefix)
             assert_source_inventory_unchanged(
                 s3, prefix, objects, mask_objects)
@@ -460,14 +745,12 @@ def reconcile_dataset(dataset_id):
                     deleted,
                     dataset_id,
                 )
-            completed = True
             return 0, len(masks)
         write_dataset_artifacts(
             s3, prefix, dataset_id, samples, masks,
             expected_images=objects, expected_masks=mask_objects,
             publish_lock=publish_lock,
         )
-        completed = True
         return len(samples), len(masks)
     except RecoveryIncomplete:
         release_lock = False
@@ -475,12 +758,15 @@ def reconcile_dataset(dataset_id):
     finally:
         if release_lock:
             released = release_publish_lock(s3, publish_lock)
-            if completed and not released:
+            if not released:
                 raise LockOwnershipLost(
                     "dataset reconciliation lock ownership was lost")
 
 
 def acquire_publish_lock(s3, prefix):
+    # Publish locks have no fenced lease shared with dsimaging-admin. Never
+    # auto-delete an existing lock: an operator must verify and remove orphans.
+    require_bucket_versioning(s3)
     owner = uuid.uuid4().hex
     key = f"{prefix}/{PUBLISH_LOCK}"
     try:
@@ -491,20 +777,68 @@ def acquire_publish_lock(s3, prefix):
             }).encode("utf-8"),
             ContentType="application/json", IfNoneMatch="*",
         )
-    except Exception:
-        if object_exists(s3, key):
+    except Exception as put_error:
+        observation_error = None
+        for attempt in range(LOCK_OBSERVE_RETRIES):
+            try:
+                current, identity = read_current_publish_lock(s3, key)
+            except Exception as exc:
+                observation_error = exc
+                if attempt + 1 < LOCK_OBSERVE_RETRIES:
+                    time.sleep(LOCK_OBSERVE_DELAY_SECONDS)
+                continue
+            if (
+                isinstance(current, dict)
+                and current.get("status") == "reconciling"
+                and current.get("owner") == owner
+            ):
+                if not usable_version_id(identity.get("version_id")):
+                    raise LockOwnershipLost(
+                        "versioned reconciliation lock was not established")
+                return {
+                    "key": key,
+                    "owner": owner,
+                    "etag": identity.get("etag"),
+                    "version_id": identity["version_id"],
+                }
             raise PublishInProgress()
-        raise
-    return {"key": key, "owner": owner, "etag": response.get("ETag")}
+        raise put_error from observation_error
+    version_id = response.get("VersionId")
+    if not usable_version_id(version_id):
+        try:
+            current, identity = read_current_publish_lock(s3, key)
+        except Exception as exc:
+            raise LockOwnershipLost(
+                "versioned reconciliation lock was not established") from exc
+        if (
+            not isinstance(current, dict)
+            or current.get("status") != "reconciling"
+            or current.get("owner") != owner
+            or not usable_version_id(identity.get("version_id"))
+        ):
+            raise LockOwnershipLost(
+                "versioned reconciliation lock was not established")
+        version_id = identity["version_id"]
+        response["ETag"] = identity.get("etag")
+    return {
+        "key": key,
+        "owner": owner,
+        "etag": response.get("ETag"),
+        "version_id": version_id,
+    }
 
 
 def release_publish_lock(s3, publish_lock):
     if not publish_lock_is_owned(s3, publish_lock):
         return False
+    if not usable_version_id(publish_lock.get("version_id")):
+        return False
     key = publish_lock["key"]
-    kwargs = {"Bucket": BUCKET, "Key": key}
-    if publish_lock.get("etag"):
-        kwargs["IfMatch"] = publish_lock["etag"]
+    kwargs = {
+        "Bucket": BUCKET,
+        "Key": key,
+        "VersionId": publish_lock["version_id"],
+    }
     try:
         s3.delete_object(**kwargs)
     except Exception:
@@ -514,16 +848,43 @@ def release_publish_lock(s3, publish_lock):
 
 def publish_lock_is_owned(s3, publish_lock):
     key = publish_lock["key"]
+    expected_etag = str(publish_lock.get("etag") or "").strip('"') or None
+    expected_version = publish_lock.get("version_id")
+    if not usable_version_id(expected_version):
+        return False
     try:
-        response = s3.get_object(Bucket=BUCKET, Key=key)
-        body = response["Body"]
-        try:
-            current = json.loads(body.read())
-        finally:
-            body.close()
+        current, identity = read_current_publish_lock(s3, key)
     except Exception:
         return False
-    return current.get("owner") == publish_lock["owner"]
+    return (
+        (not expected_etag or identity["etag"] == expected_etag)
+        and identity["version_id"] == expected_version
+        and isinstance(current, dict)
+        and current.get("status") == "reconciling"
+        and current.get("owner") == publish_lock["owner"]
+    )
+
+
+def current_object_identity(s3, key):
+    response = s3.head_object(Bucket=BUCKET, Key=key)
+    return {
+        "etag": str(response.get("ETag") or "").strip('"') or None,
+        "version_id": response.get("VersionId"),
+    }
+
+
+def read_current_publish_lock(s3, key):
+    before = current_object_identity(s3, key)
+    response = s3.get_object(Bucket=BUCKET, Key=key)
+    body = response["Body"]
+    try:
+        current = json.loads(body.read())
+    finally:
+        body.close()
+    after = current_object_identity(s3, key)
+    if before != after:
+        raise RuntimeError("publication lock changed while it was read")
+    return current, before
 
 
 def assert_publish_lock_owned(s3, publish_lock):
@@ -605,43 +966,50 @@ def write_dataset_artifacts(s3, prefix, dataset_id, samples, masks=None, *,
                             expected_images=None, expected_masks=None,
                             publish_lock=None):
     existing_manifest = read_existing_manifest(s3, prefix)
-    contract = metadata_contract_from_manifest(existing_manifest)
+    contract = read_metadata_contract(existing_manifest)
     extra_metadata = read_existing_samples_metadata(s3, prefix)
     masks = masks or []
     with tempfile.TemporaryDirectory() as tmpdir:
-        uploads = [
-            ("indexes/content_hash_index.parquet",
-             write_parquet(tmpdir, "content_hash_index.parquet",
-                           build_hash_index(prefix, samples, source_path="images"))),
-            ("metadata/sample_manifests.parquet",
-             write_parquet(tmpdir, "sample_manifests.parquet",
-                           build_sample_manifests(samples))),
-            ("metadata/samples.parquet",
-             write_parquet(tmpdir, "samples.parquet",
-                           build_samples_metadata(
-                               samples, extra_metadata,
-                               privacy_unit_col=contract["privacy_unit_col"],
-                               label_col=contract.get("label_col"),
-                               label_levels=contract.get("label_levels"),
-                           ))),
-            ("manifest.yaml",
-             write_yaml(tmpdir, "manifest.yaml",
-                        generate_manifest(
-                            dataset_id, prefix,
-                            existing_manifest.get("modality") or "unknown",
-                            has_masks=bool(masks),
-                            privacy_unit_col=contract["privacy_unit_col"],
-                            label_col=contract.get("label_col"),
-                            label_levels=contract.get("label_levels"),
-                            existing_manifest=existing_manifest,
-                        ))),
-        ]
-        if masks:
-            uploads.append(
-                ("indexes/masks_content_hash_index.parquet",
-                 write_parquet(tmpdir, "masks_content_hash_index.parquet",
-                               build_hash_index(prefix, masks, source_path="masks")))
-            )
+        try:
+            uploads = [
+                ("indexes/content_hash_index.parquet",
+                 write_parquet(tmpdir, "content_hash_index.parquet",
+                               build_hash_index(
+                                   prefix, samples, source_path="images"))),
+                ("metadata/sample_manifests.parquet",
+                 write_parquet(tmpdir, "sample_manifests.parquet",
+                               build_sample_manifests(samples))),
+                ("metadata/samples.parquet",
+                 write_parquet(tmpdir, "samples.parquet",
+                               build_samples_metadata(
+                                   samples, extra_metadata,
+                                   privacy_unit_col=contract["privacy_unit_col"],
+                                   label_col=contract.get("label_col"),
+                                   label_levels=contract.get("label_levels"),
+                               ))),
+                ("manifest.yaml",
+                 write_yaml(tmpdir, "manifest.yaml",
+                            generate_manifest(
+                                dataset_id, prefix,
+                                existing_manifest.get("modality") or "unknown",
+                                has_masks=bool(masks),
+                                privacy_unit_col=contract["privacy_unit_col"],
+                                label_col=contract.get("label_col"),
+                                label_levels=contract.get("label_levels"),
+                                existing_manifest=existing_manifest,
+                            ))),
+            ]
+            if masks:
+                uploads.append(
+                    ("indexes/masks_content_hash_index.parquet",
+                     write_parquet(
+                         tmpdir, "masks_content_hash_index.parquet",
+                         build_hash_index(prefix, masks, source_path="masks")))
+                )
+        except InvalidDatasetContent:
+            raise
+        except ValueError as exc:
+            raise InvalidDatasetContent(str(exc)) from exc
         # Generate and validate everything before changing the published set.
         # Upload the manifest last and restore the prior derived objects if an
         # upload fails midway.
@@ -718,22 +1086,19 @@ def build_samples_metadata(samples, extra_metadata=None, *,
 def read_existing_samples_metadata(s3, prefix):
     key = f"{prefix}/metadata/samples.parquet"
     if not object_exists(s3, key):
-        raise ValueError("samples metadata is missing")
+        raise InvalidDatasetContent("samples metadata is missing")
+    response = s3.get_object(Bucket=BUCKET, Key=key)
+    body = response["Body"]
     try:
-        response = s3.get_object(Bucket=BUCKET, Key=key)
-        body = response["Body"]
-        try:
-            data = body.read()
-        finally:
-            body.close()
-    except Exception as exc:
-        raise ValueError("samples metadata could not be read") from exc
+        data = body.read()
+    finally:
+        body.close()
     if not data:
-        raise ValueError("samples metadata is empty")
+        raise InvalidDatasetContent("samples metadata is empty")
     try:
         return pq.read_table(pa.BufferReader(data))
-    except Exception as exc:
-        raise ValueError("samples metadata is corrupt") from exc
+    except (OSError, pa.ArrowInvalid, pa.ArrowTypeError) as exc:
+        raise InvalidDatasetContent("samples metadata is corrupt") from exc
 
 
 def generate_manifest(dataset_id, prefix, modality, has_masks=False, *,
@@ -750,20 +1115,32 @@ def generate_manifest(dataset_id, prefix, modality, has_masks=False, *,
 def read_existing_manifest(s3, prefix):
     key = f"{prefix}/manifest.yaml"
     if not object_exists(s3, key):
-        raise ValueError("dataset manifest is missing; publish with dsimaging-admin first")
+        raise InvalidDatasetContent(
+            "dataset manifest is missing; publish with dsimaging-admin first")
+    response = s3.get_object(Bucket=BUCKET, Key=key)
+    body = response["Body"]
     try:
-        response = s3.get_object(Bucket=BUCKET, Key=key)
-        body = response["Body"]
-        try:
-            manifest = yaml.safe_load(body.read())
-        finally:
-            body.close()
-    except Exception as exc:
-        raise ValueError("dataset manifest is corrupt") from exc
+        data = body.read()
+    finally:
+        body.close()
+    try:
+        manifest = yaml.safe_load(data)
+    except (RecursionError, UnicodeError, yaml.YAMLError) as exc:
+        raise InvalidDatasetContent("dataset manifest is corrupt") from exc
     if not isinstance(manifest, dict):
-        raise ValueError("dataset manifest must be a mapping")
-    validate_manifest_scope(manifest, BUCKET, prefix)
+        raise InvalidDatasetContent("dataset manifest must be a mapping")
+    try:
+        validate_manifest_scope(manifest, BUCKET, prefix)
+    except ValueError as exc:
+        raise InvalidDatasetContent(str(exc)) from exc
     return manifest
+
+
+def read_metadata_contract(manifest):
+    try:
+        return metadata_contract_from_manifest(manifest)
+    except ValueError as exc:
+        raise InvalidDatasetContent(str(exc)) from exc
 
 
 def snapshot_dataset_artifacts(s3, prefix):
@@ -830,12 +1207,15 @@ def utc_now():
 
 def main():
     port = int(os.environ.get("PORT", "8080"))
-    thread = threading.Thread(target=reconcile_loop, daemon=True)
-    thread.start()
+    # HTTPServer binds and starts listening here, before durable recovery is
+    # attempted. Incoming webhooks therefore wait or receive a non-2xx rather
+    # than being lost while S3 is unavailable.
+    server = HTTPServer(("0.0.0.0", port), Handler)
     if SQS_QUEUE_URL:
         sqs_thread = threading.Thread(target=sqs_loop, daemon=True)
         sqs_thread.start()
-    server = HTTPServer(("0.0.0.0", port), Handler)
+    thread = threading.Thread(target=recover_then_reconcile, daemon=True)
+    thread.start()
     log.info("Controller listening on port %s", port)
     log.info("S3 endpoint: %s, Bucket: %s", S3_ENDPOINT or "<aws-default>", BUCKET)
     log.info("AWS region: %s", AWS_REGION)

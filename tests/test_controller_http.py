@@ -15,18 +15,65 @@ controller = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(controller)
 
 
+class FakeMarkerPaginator:
+    def __init__(self, objects):
+        self.objects = objects
+
+    def paginate(self, Bucket, Prefix):
+        yield {
+            "Contents": [
+                {"Key": key} for key in sorted(self.objects)
+                if key.startswith(Prefix)
+            ],
+        }
+
+
+class FakeMarkerS3:
+    def __init__(self):
+        self.objects = {}
+
+    def get_bucket_versioning(self, Bucket):
+        return {"Status": "Enabled"}
+
+    def put_object(self, Bucket, Key, Body, **kwargs):
+        if kwargs.get("IfNoneMatch") == "*" and Key in self.objects:
+            raise RuntimeError("precondition failed")
+        self.objects[Key] = bytes(Body)
+        return {"VersionId": f"version-{Key}"}
+
+    def get_paginator(self, name):
+        if name != "list_objects_v2":
+            raise ValueError(name)
+        return FakeMarkerPaginator(self.objects)
+
+    def head_object(self, Bucket, Key):
+        if Key not in self.objects:
+            raise KeyError(Key)
+        return {"VersionId": f"version-{Key}"}
+
+    def delete_object(self, Bucket, Key, VersionId=None):
+        if Key not in self.objects:
+            raise KeyError(Key)
+        if VersionId != f"version-{Key}":
+            raise RuntimeError("wrong version")
+        del self.objects[Key]
+
+
 class ControllerHttpTests(unittest.TestCase):
     def setUp(self):
         self.old_token = controller.OPERATOR_TOKEN
         self.old_webhook_token = controller.WEBHOOK_TOKEN
         self.old_limit = controller.MAX_WEBHOOK_BODY_BYTES
         self.old_bucket = controller.BUCKET
+        self.old_get_s3 = controller.get_s3
         controller.OPERATOR_TOKEN = ""
         controller.WEBHOOK_TOKEN = "webhook-token"
         controller.MAX_WEBHOOK_BODY_BYTES = 1024 * 1024
         controller.dirty_datasets.clear()
         controller.last_reconcile.clear()
         controller.last_errors.clear()
+        self.s3 = FakeMarkerS3()
+        controller.get_s3 = lambda: self.s3
         self.server = controller.HTTPServer(
             ("127.0.0.1", 0), controller.Handler)
         self.thread = threading.Thread(
@@ -41,6 +88,7 @@ class ControllerHttpTests(unittest.TestCase):
         controller.WEBHOOK_TOKEN = self.old_webhook_token
         controller.MAX_WEBHOOK_BODY_BYTES = self.old_limit
         controller.BUCKET = self.old_bucket
+        controller.get_s3 = self.old_get_s3
         controller.dirty_datasets.clear()
         controller.last_reconcile.clear()
         controller.last_errors.clear()
@@ -162,6 +210,49 @@ class ControllerHttpTests(unittest.TestCase):
         self.assertEqual(payload, {"status": "ok"})
         self.assertNotIn("study", json.dumps(payload))
         self.assertIn("study", controller.dirty_datasets)
+        self.assertEqual(len(self.s3.objects), 1)
+        marker_key = next(iter(self.s3.objects))
+        self.assertEqual(
+            controller.dataset_id_from_dirty_marker_key(marker_key), "study")
+
+    def test_malformed_record_does_not_discard_valid_webhook_record(self):
+        event = json.dumps({
+            "Records": [{
+                "eventName": "ObjectCreated:Put",
+                "s3": {"object": {
+                    "key": "datasets/study/source/images/case001.nii.gz",
+                }},
+            }, {"s3": "malformed"}],
+        }).encode("utf-8")
+
+        status, payload = self.request(
+            "POST", "/webhook/minio", token="webhook-token", body=event)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"status": "ok"})
+        self.assertIn("study", controller.dirty_datasets)
+        self.assertEqual(len(self.s3.objects), 1)
+
+    def test_webhook_storage_failure_is_not_acknowledged(self):
+        event = json.dumps({
+            "Records": [{
+                "eventName": "ObjectCreated:Put",
+                "s3": {"object": {
+                    "key": "datasets/study/source/images/case001.nii.gz",
+                }},
+            }],
+        }).encode("utf-8")
+
+        with patch.object(
+                controller, "persist_dirty_datasets",
+                side_effect=RuntimeError("storage unavailable")):
+            with self.assertLogs(controller.log, level="ERROR"):
+                status, payload = self.request(
+                    "POST", "/webhook/minio", token="webhook-token", body=event)
+
+        self.assertEqual(status, 503)
+        self.assertEqual(payload, {"error": "temporarily unavailable"})
+        self.assertNotIn("study", controller.dirty_datasets)
 
     def test_webhook_requires_its_dedicated_bearer(self):
         event = json.dumps({"Records": []}).encode("utf-8")

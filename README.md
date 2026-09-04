@@ -117,6 +117,21 @@ The controller reacts to object-created and object-removed events under:
 - `datasets/<dataset_id>/source/images/`
 - `datasets/<dataset_id>/source/masks/`
 
+Before acknowledging a webhook or deleting an SQS message, it writes a durable
+`_controller/dirty/<dataset_id>/<event-id>` marker. Startup recovery lists only
+these markers, rather than rescanning every collection. A successful reconcile
+removes only the marker objects observed before it began, by exact version ID;
+a concurrent event uses a new marker and remains pending.
+Transient storage failures and active publication locks retain their markers
+for retry. Deterministically invalid source, manifest, or metadata content is
+recorded without a continuous retry; fixing the source or requesting an
+explicit reconcile creates fresh work.
+On the first upgraded start, an idempotent one-shot migration seeds one marker
+for each existing first-level `datasets/<dataset_id>/` prefix, then records its
+completion under `_controller/migrations/`. Later starts and periodic refreshes
+list only dirty markers. Do not run old and new controller versions concurrently
+during this migration.
+
 It rebuilds:
 
 - `indexes/content_hash_index.parquet`
@@ -137,9 +152,27 @@ the source roster is rechecked before the manifest is uploaded last, and previou
 derived files are restored when a mid-upload failure can be rolled back. A
 controller only removes the lock instance it acquired itself.
 
+Publication locks intentionally have no automatic expiry: without a fenced
+lease, deleting a lock considered "old" could overlap a writer that resumes.
+After an abnormal controller or admin exit, first quiesce and verify that no
+writer is active, inspect the lock owner/status and current object version, then
+remove only that exact `.publish-lock` version with version-aware S3 tooling.
+The durable dirty marker remains pending and reconciliation resumes after the
+lock is removed. The controller never reclaims an existing lock automatically.
+
+Bucket versioning is required and checked before the controller creates work or
+publication locks. On AWS, its role therefore needs `s3:GetBucketVersioning`;
+`s3:ListBucket` restricted to the `datasets/` and `_controller/dirty/` prefixes;
+and `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, and
+`s3:DeleteObjectVersion` for `_controller/dirty/*`. The one-shot migration also
+needs `s3:GetObject` and `s3:PutObject` for `_controller/migrations/*`.
+Version-aware lock release needs `s3:DeleteObjectVersion` for
+`datasets/*/.publish-lock`. Keep all `_controller/` paths server-only;
+DataSHIELD users do not need read or write access to them.
+
 A prefix that has been completely removed by the version-preserving
 `dsimaging-admin dataset delete` workflow reconciles as a successful deletion;
-if any current object remains, reconciliation fails and is retried. Supported
+if invalid current objects remain, reconciliation fails closed. Supported
 admin writes honor the dataset lock. Direct bucket writes bypass that contract
 and therefore depend on reliable bucket events; after any such operator action,
 run an explicit reconcile if event delivery is uncertain.

@@ -14,9 +14,10 @@ SPEC.loader.exec_module(controller)
 
 
 class FakeSQS:
-    def __init__(self, body):
+    def __init__(self, body, operations=None):
         self.body = body
         self.deleted = []
+        self.operations = operations
 
     def receive_message(self, QueueUrl, MaxNumberOfMessages, WaitTimeSeconds):
         return {
@@ -27,17 +28,40 @@ class FakeSQS:
         }
 
     def delete_message(self, QueueUrl, ReceiptHandle):
+        if self.operations is not None:
+            self.operations.append("delete-message")
         self.deleted.append((QueueUrl, ReceiptHandle))
+
+
+class FakeMarkerS3:
+    def __init__(self, operations=None):
+        self.objects = {}
+        self.operations = operations
+
+    def get_bucket_versioning(self, Bucket):
+        if self.operations is not None:
+            self.operations.append("check-versioning")
+        return {"Status": "Enabled"}
+
+    def put_object(self, Bucket, Key, Body, **kwargs):
+        if self.operations is not None:
+            self.operations.append("put-marker")
+        self.objects[Key] = bytes(Body)
+        return {"VersionId": f"version-{Key}"}
 
 
 class SqsTests(unittest.TestCase):
     def setUp(self):
         self.old_dirty = set(controller.dirty_datasets)
+        self.old_get_s3 = controller.get_s3
         controller.dirty_datasets.clear()
+        self.s3 = FakeMarkerS3()
+        controller.get_s3 = lambda: self.s3
 
     def tearDown(self):
         controller.dirty_datasets.clear()
         controller.dirty_datasets.update(self.old_dirty)
+        controller.get_s3 = self.old_get_s3
 
     def test_sqs_poll_mode_processes_s3_event_through_shared_path(self):
         event = {
@@ -46,7 +70,9 @@ class SqsTests(unittest.TestCase):
                 "s3": {"object": {"key": "datasets/lung_ct/source/images/case001.nii.gz"}},
             }]
         }
-        sqs = FakeSQS(json.dumps(event))
+        operations = []
+        sqs = FakeSQS(json.dumps(event), operations)
+        self.s3.operations = operations
         with self.assertLogs(controller.log, level="INFO") as captured:
             processed = controller.process_sqs_messages(
                 sqs, "https://sqs.example/dsimaging", wait_time_seconds=0)
@@ -55,6 +81,11 @@ class SqsTests(unittest.TestCase):
         self.assertEqual(sqs.deleted, [("https://sqs.example/dsimaging", "receipt-1")])
         self.assertIn("lung_ct", controller.dirty_datasets)
         self.assertNotIn("case001", "\n".join(captured.output))
+        self.assertEqual(
+            operations,
+            ["check-versioning", "put-marker", "delete-message"],
+        )
+        self.assertEqual(len(self.s3.objects), 1)
 
     def test_sns_wrapped_s3_event_is_supported(self):
         event = {
@@ -81,6 +112,28 @@ class SqsTests(unittest.TestCase):
 
         self.assertEqual(controller.handle_s3_event_payload(event), 0)
         self.assertEqual(controller.dirty_datasets, set())
+
+    def test_malformed_record_does_not_discard_valid_record(self):
+        event = {
+            "Records": [{
+                "eventName": "ObjectCreated:Put",
+                "s3": {"object": {
+                    "key": "datasets/lung_ct/source/images/case001.nii.gz",
+                }},
+            }, None],
+        }
+        sqs = FakeSQS(json.dumps(event))
+
+        processed = controller.process_sqs_messages(
+            sqs, "https://sqs.example/dsimaging", wait_time_seconds=0)
+
+        self.assertEqual(processed, 1)
+        self.assertIn("lung_ct", controller.dirty_datasets)
+        self.assertEqual(len(self.s3.objects), 1)
+        self.assertEqual(
+            sqs.deleted,
+            [("https://sqs.example/dsimaging", "receipt-1")],
+        )
 
     def test_malformed_message_is_discarded_instead_of_wedging_batch(self):
         sqs = FakeSQS("{not json")
@@ -114,7 +167,7 @@ class SqsTests(unittest.TestCase):
         sqs = FakeSQS(json.dumps({"Records": []}))
 
         with patch.object(
-                controller, "handle_s3_event_payload",
+                controller, "persist_dirty_datasets",
                 side_effect=RuntimeError("temporary failure")):
             with self.assertRaisesRegex(RuntimeError, "temporary failure"):
                 controller.process_sqs_messages(
@@ -123,6 +176,46 @@ class SqsTests(unittest.TestCase):
                 )
 
         self.assertEqual(sqs.deleted, [])
+
+    def test_marker_write_failure_keeps_valid_message_for_retry(self):
+        event = {
+            "Records": [{
+                "eventName": "ObjectCreated:Put",
+                "s3": {"object": {
+                    "key": "datasets/lung_ct/source/images/case001.nii.gz",
+                }},
+            }],
+        }
+        sqs = FakeSQS(json.dumps(event))
+
+        with patch.object(
+                controller, "put_dirty_marker",
+                side_effect=RuntimeError("storage unavailable")):
+            with self.assertRaisesRegex(RuntimeError, "storage unavailable"):
+                controller.process_sqs_messages(
+                    sqs, "https://sqs.example/dsimaging",
+                    wait_time_seconds=0,
+                )
+
+        self.assertEqual(sqs.deleted, [])
+        self.assertEqual(controller.dirty_datasets, set())
+
+    def test_sqs_client_initialization_retries_with_backoff(self):
+        sqs = FakeSQS(json.dumps({"Records": []}))
+        with patch.object(controller, "SQS_QUEUE_URL", "queue-url"), \
+                patch.object(
+                    controller, "get_sqs",
+                    side_effect=[RuntimeError("temporarily unavailable"), sqs],
+                ) as get_sqs, patch.object(
+                    controller, "process_sqs_messages",
+                    side_effect=KeyboardInterrupt,
+                ), patch.object(controller.time, "sleep") as sleep:
+            with self.assertLogs(controller.log, level="ERROR"):
+                with self.assertRaises(KeyboardInterrupt):
+                    controller.sqs_loop()
+
+        self.assertEqual(get_sqs.call_count, 2)
+        sleep.assert_called_once_with(1)
 
 
 if __name__ == "__main__":
