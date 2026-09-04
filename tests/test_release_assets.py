@@ -6,7 +6,7 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RELEASE_VERSION = "0.3.10"
+RELEASE_VERSION = "0.3.11"
 
 
 class ReleaseAssetTests(unittest.TestCase):

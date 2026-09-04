@@ -416,6 +416,22 @@ def reconcile_dataset(dataset_id):
             sample_ids=[sample["sample_id"] for sample in samples],
         )
         if not samples:
+            current_keys = {
+                obj["key"] for obj in list_objects(s3, f"{prefix}/")
+            }
+            if current_keys == {publish_lock["key"]}:
+                assert_source_inventory_unchanged(
+                    s3, prefix, objects, mask_objects)
+                assert_publish_lock_owned(s3, publish_lock)
+                confirmed_keys = {
+                    obj["key"] for obj in list_objects(s3, f"{prefix}/")
+                }
+                if confirmed_keys != {publish_lock["key"]}:
+                    raise RuntimeError(
+                        "dataset changed during deleted-prefix reconciliation"
+                    )
+                completed = True
+                return 0, 0
             manifest = read_existing_manifest(s3, prefix)
             metadata_contract_from_manifest(manifest)
             read_existing_samples_metadata(s3, prefix)

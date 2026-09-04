@@ -135,6 +135,142 @@ class ReconcileTests(unittest.TestCase):
                 controller.reconcile_dataset("../other")
         get_s3.assert_not_called()
 
+    def test_reconcile_loop_does_not_requeue_fully_deleted_dataset(self):
+        dataset_id = "study_ct_v1"
+        s3 = FakeS3({})
+        controller.get_s3 = lambda: s3
+        dirty = {dataset_id}
+        successes = {}
+        failures = {dataset_id: {"at": "previous failure"}}
+
+        with patch.multiple(
+                controller,
+                dirty_datasets=dirty,
+                last_reconcile=successes,
+                last_errors=failures,
+        ), patch.object(
+                controller, "record_success", wraps=controller.record_success,
+        ) as record_success, patch.object(
+                controller.time, "sleep", side_effect=StopIteration,
+        ):
+            with self.assertRaises(StopIteration):
+                controller.reconcile_loop()
+
+        record_success.assert_called_once_with(dataset_id, 0, 0)
+        self.assertEqual(dirty, set())
+        self.assertIn(dataset_id, successes)
+        self.assertEqual(failures, {})
+        self.assertEqual(s3.objects, {})
+
+    def test_reconcile_loop_requeues_when_any_other_object_remains(self):
+        dataset_id = "study_ct_v1"
+        prefix = f"datasets/{dataset_id}"
+        leftover_key = f"{prefix}/unmanaged-object"
+        s3 = FakeS3({leftover_key: b"leftover"})
+        controller.get_s3 = lambda: s3
+        dirty = {dataset_id}
+        successes = {}
+        failures = {}
+
+        with patch.multiple(
+                controller,
+                dirty_datasets=dirty,
+                last_reconcile=successes,
+                last_errors=failures,
+        ), patch.object(
+                controller, "record_failure", wraps=controller.record_failure,
+        ) as record_failure, patch.object(
+                controller.time, "sleep", side_effect=StopIteration,
+        ):
+            with self.assertLogs(controller.log, level="ERROR"):
+                with self.assertRaises(StopIteration):
+                    controller.reconcile_loop()
+
+        failure = record_failure.call_args.args[1]
+        self.assertIsInstance(failure, ValueError)
+        self.assertIn("manifest is missing", str(failure))
+        self.assertEqual(dirty, {dataset_id})
+        self.assertEqual(successes, {})
+        self.assertIn(dataset_id, failures)
+        self.assertEqual(s3.objects, {leftover_key: b"leftover"})
+
+    def test_deleted_prefix_rechecks_source_after_first_prefix_listing(self):
+        dataset_id = "study_ct_v1"
+        prefix = f"datasets/{dataset_id}"
+        late_key = f"{prefix}/source/images/late.nii.gz"
+        s3 = FakeS3({})
+        controller.get_s3 = lambda: s3
+        original_list = controller.list_objects
+        injected = False
+
+        def list_then_inject(client, requested_prefix, **kwargs):
+            nonlocal injected
+            result = original_list(client, requested_prefix, **kwargs)
+            if requested_prefix == f"{prefix}/" and not injected:
+                s3.objects[late_key] = b"late-source"
+                injected = True
+            return result
+
+        with patch.object(controller, "list_objects",
+                          side_effect=list_then_inject), self.assertRaisesRegex(
+                              RuntimeError, "source roster changed"):
+            controller.reconcile_dataset(dataset_id)
+
+        self.assertEqual(s3.objects, {late_key: b"late-source"})
+
+    def test_deleted_prefix_rechecks_lock_ownership(self):
+        dataset_id = "study_ct_v1"
+        prefix = f"datasets/{dataset_id}"
+        lock_key = f"{prefix}/{controller.PUBLISH_LOCK}"
+        s3 = FakeS3({})
+        controller.get_s3 = lambda: s3
+        original_list = controller.list_objects
+        replaced = False
+
+        def list_then_replace_lock(client, requested_prefix, **kwargs):
+            nonlocal replaced
+            result = original_list(client, requested_prefix, **kwargs)
+            if requested_prefix == f"{prefix}/" and not replaced:
+                s3.objects[lock_key] = (
+                    b'{"status":"publishing","owner":"replacement"}')
+                replaced = True
+            return result
+
+        with patch.object(controller, "list_objects",
+                          side_effect=list_then_replace_lock), self.assertRaisesRegex(
+                              controller.LockOwnershipLost,
+                              "ownership was lost"):
+            controller.reconcile_dataset(dataset_id)
+
+        self.assertEqual(
+            s3.objects[lock_key],
+            b'{"status":"publishing","owner":"replacement"}',
+        )
+
+    def test_event_arriving_during_reconcile_remains_dirty(self):
+        dataset_id = "study_ct_v1"
+        dirty = {dataset_id}
+
+        def reconcile_then_receive_event(_dataset_id):
+            controller.mark_dirty(_dataset_id)
+            return 0, 0
+
+        with patch.multiple(
+                controller,
+                dirty_datasets=dirty,
+                last_reconcile={},
+                last_errors={},
+        ), patch.object(
+                controller, "reconcile_dataset",
+                side_effect=reconcile_then_receive_event,
+        ), patch.object(
+                controller.time, "sleep", side_effect=StopIteration,
+        ):
+            with self.assertRaises(StopIteration):
+                controller.reconcile_loop()
+
+        self.assertEqual(dirty, {dataset_id})
+
     def setUp(self):
         self.bucket = "imaging-data"
         self.old_bucket = controller.BUCKET

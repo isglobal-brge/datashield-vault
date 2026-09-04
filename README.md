@@ -8,13 +8,16 @@ are written by dsHPC into its artifact/publish directories, not into this store.
 
 ## Local MinIO
 
-Use `dsimaging-admin` for lifecycle management:
+Use `dsimaging-admin` for the normal one-command setup:
 
 ```bash
-dsimaging-admin --backend minio store init ./study-store
-dsimaging-admin store up ./study-store
-dsimaging-admin store doctor ./study-store
+dsimaging-admin store setup ./study-store
 ```
+
+The command checks Docker Compose first, creates or validates the project,
+starts it, waits for the complete health check, and stores a non-secret local
+profile pointer. The lower-level `store init`, `up`, and `doctor` commands
+remain available for custom provisioning and troubleshooting.
 
 `store init` writes a Compose project with versioned controller, MinIO and MinIO
 client images pinned by multi-architecture manifest digest, unique credentials
@@ -26,7 +29,7 @@ credential is built in.
 The published controller supports both `linux/amd64` and `linux/arm64`:
 
 ```bash
-docker pull davidsarrat/dsimaging-store:0.3.10
+docker pull davidsarrat/dsimaging-store:0.3.11
 ```
 
 For controller development, opt into a build from a checked-out source tree:
@@ -133,6 +136,13 @@ of replacing it with a reduced table. Derived files are validated before upload,
 the source roster is rechecked before the manifest is uploaded last, and previous
 derived files are restored when a mid-upload failure can be rolled back. A
 controller only removes the lock instance it acquired itself.
+
+A prefix that has been completely removed by the version-preserving
+`dsimaging-admin dataset delete` workflow reconciles as a successful deletion;
+if any current object remains, reconciliation fails and is retried. Supported
+admin writes honor the dataset lock. Direct bucket writes bypass that contract
+and therefore depend on reliable bucket events; after any such operator action,
+run an explicit reconcile if event delivery is uncertain.
 
 ## Configuration
 
