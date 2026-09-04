@@ -29,7 +29,7 @@ credential is built in.
 The published controller supports both `linux/amd64` and `linux/arm64`:
 
 ```bash
-docker pull davidsarrat/dsimaging-store:0.3.12
+docker pull davidsarrat/dsimaging-store:0.3.13
 ```
 
 For controller development, opt into a build from a checked-out source tree:
